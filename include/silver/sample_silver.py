@@ -22,8 +22,10 @@ with open(Path(__file__).parent.parent / "schema.yaml") as f:
 
 BRONZE = schema["bronze"]
 BRONZE_PATH = BRONZE["path"]
+BRONZE_TABLES = BRONZE["tables"]
 SILVER = schema["silver"]
 SILVER_PATH = SILVER["path"]
+SILVER_TABLES = SILVER["tables"]
 
 spark = create_spark_session("sample-silver")
 
@@ -39,8 +41,8 @@ def sample_processing_function(bronze_table_path, silver_table_path, spark):
         logger.error(e)
 
 
-bronze_table_path = f"{BRONZE_PATH}/legal_docs_raw"
-silver_table_path = f"{SILVER_PATH}/legal_docs_processed"
+bronze_table_path = f"{BRONZE_PATH}/{BRONZE_TABLES['legal_docs_raw']['path']}"
+silver_table_path = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
 sample_processing_function(bronze_table_path, silver_table_path, spark)
 
 

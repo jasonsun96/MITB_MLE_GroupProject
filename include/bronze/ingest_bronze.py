@@ -1,7 +1,7 @@
 import argparse
-import datetime
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -27,6 +27,7 @@ with open(Path(__file__).parent.parent / "schema.yaml") as f:
 
 LANDING = schema["landing"]
 BRONZE = schema["bronze"]
+BRONZE_TABLES = BRONZE["tables"]
 LANDING_PATH = LANDING["path"]
 BRONZE_PATH = BRONZE["path"]
 START_DATE = args.start_date or schema["backfill"]["start_date"]
@@ -84,7 +85,7 @@ def process_bronze_table(table_name, table_config, source_path, bronze_path, spa
             df = df.filter(F.col("snapshot_date") == snapshot_date_str)
 
         partition_col = table_config["partition_col"]
-        output_path = os.path.join(bronze_path, table_config["table_dir"])
+        output_path = os.path.join(bronze_path, table_config["path"])
 
         writer = df.write.format("delta").option("mergeSchema", "true")
         if snapshot_date_str is not None:
@@ -105,7 +106,7 @@ for dataset_name in LANDING:
     file_prefix = LANDING[dataset_name].get("file_prefix")
     filename = LANDING[dataset_name].get("filename")
     bronze_path = BRONZE_PATH
-    bronze_tables = BRONZE[dataset_name]["tables"]
+    landing_tables = LANDING[dataset_name]["tables"]
 
     if file_prefix:
         dates = get_dates(spark, source_path, file_prefix, START_DATE, END_DATE)
@@ -114,7 +115,8 @@ for dataset_name in LANDING:
         dates = [None]
 
     for date_str in dates:
-        for table_name, table_config in bronze_tables.items():
+        for table_name, landing_table_config in landing_tables.items():
+            table_config = {**BRONZE_TABLES[table_name], **landing_table_config}
             logger.debug(f"Bronze [{dataset_name}]: {table_name} @ {date_str}")
             process_bronze_table(table_name, table_config, source_path, bronze_path, spark, date_str, file_prefix, filename)
 

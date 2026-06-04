@@ -14,7 +14,7 @@ R2_ENV = {
 
 with DAG(
     dag_id="medallion_pipeline",
-    start_time=datetime(2024, 1, 1),
+    start_date=datetime(2024, 1, 1),
     schedule="@monthly",
 ):
     ingest_bronze = DockerOperator(
