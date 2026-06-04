@@ -34,3 +34,14 @@ with DAG(
         auto_remove="force",
         docker_url="unix://var/run/docker.sock",
     )
+
+    process_gold = DockerOperator(
+        task_id="process_gold",
+        image=IMAGE_NAME,
+        command="python include/gold/sample_gold.py",
+        environment=R2_ENV,
+        auto_remove="force",
+        docker_url="unix://var/run/docker.sock",
+    )
+
+    ingest_bronze >> process_silver >> process_gold
