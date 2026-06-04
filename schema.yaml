@@ -1,0 +1,47 @@
+r2:
+  bucket: cs611-project
+
+backfill:
+  start_date: "1983-01-01"
+  end_date: "2024-12-31"
+
+landing:
+  path: "s3a://cs611-project/landing"
+  legal_docs:
+    folder: "legal_docs"
+    file_prefix: "EurLex_snapshot_"
+    tables:
+      legal_docs_raw:
+        partition_col: snapshot_date
+  wiki_docs:
+    folder: "wiki_docs"
+    filename: "wiki.csv"
+    tables:
+      wiki_docs_raw:
+        partition_col: snapshot_date
+
+bronze:
+  path: "s3a://cs611-project/bronze"
+  tables:
+    legal_docs_raw:
+      path: legal_docs_raw
+      partition_col: snapshot_date
+    wiki_docs_raw:
+      path: wiki_docs_raw
+      partition_col: snapshot_date
+
+silver:
+  path: "s3a://cs611-project/silver"
+  tables:
+    legal_docs_processed:
+      path: legal_docs_processed
+      partition_col: snapshot_date
+    wiki_docs_processed:
+      path: wiki_docs_processed
+      partition_col: snapshot_date
+
+gold:
+  path: "s3a://cs611-project/gold"
+  tables:
+    sample_gold:
+      path: sample_gold
