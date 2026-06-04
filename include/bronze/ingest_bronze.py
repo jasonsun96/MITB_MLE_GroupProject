@@ -1,17 +1,13 @@
 import argparse
+import datetime
 import logging
 import os
-from datetime import datetime
 from pathlib import Path
 
-import pyspark
 import yaml
-from delta import configure_spark_with_delta_pip
-from dotenv import load_dotenv
+from pyspark.sql import functions as F
 
-from utils.data_processing_bronze import process_bronze_table
-
-load_dotenv(Path(__file__).parent / ".env")
+from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Bronze layer ingestion pipeline")
 parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -26,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-with open("schema.yaml") as f:
+with open(Path(__file__).parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
 LANDING = schema["landing"]
@@ -36,30 +32,7 @@ BRONZE_PATH = BRONZE["path"]
 START_DATE = args.start_date or schema["backfill"]["start_date"]
 END_DATE = args.end_date or schema["backfill"]["end_date"]
 
-ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
-ACCESS_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
-SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
-R2_ENDPOINT = f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-builder = (
-    pyspark.sql.SparkSession.builder.appName("mle-bronze-ingest")
-    .master("local[*]")
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-    .config("spark.hadoop.fs.s3a.endpoint", R2_ENDPOINT)
-    .config("spark.hadoop.fs.s3a.access.key", ACCESS_KEY_ID)
-    .config("spark.hadoop.fs.s3a.secret.key", SECRET_ACCESS_KEY)
-    .config("spark.hadoop.fs.s3a.path.style.access", "true")
-    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-)
-spark = configure_spark_with_delta_pip(
-    builder,
-    extra_packages=[
-        "org.apache.hadoop:hadoop-aws:3.3.4",
-        "com.amazonaws:aws-java-sdk-bundle:1.12.262",
-    ],
-).getOrCreate()
-spark.sparkContext.setLogLevel("ERROR")
+spark = create_spark_session("ingest_bronze")
 
 
 def get_dates(spark, source_path, file_prefix, start_date_str, end_date_str):
@@ -91,6 +64,40 @@ def get_dates(spark, source_path, file_prefix, start_date_str, end_date_str):
 
 logger.info(f"Bronze ingest started | {START_DATE} to {END_DATE}")
 
+
+def process_bronze_table(table_name, table_config, source_path, bronze_path, spark, snapshot_date_str=None, file_prefix=None, filename=None):
+    try:
+        if file_prefix and snapshot_date_str:
+            date_nodash = snapshot_date_str.replace("-", "")
+            resolved_filename = f"{file_prefix}{date_nodash}.csv"
+        elif filename:
+            resolved_filename = filename
+        else:
+            resolved_filename = f"{table_name}.csv"
+        source_file_path = os.path.join(source_path, resolved_filename)
+        df = spark.read.csv(source_file_path, header=True, inferSchema=False, multiLine=True, maxCharsPerColumn=10000000, maxColumns=100000)
+
+        if snapshot_date_str is not None:
+            df = df.withColumn("snapshot_date", F.lit(snapshot_date_str))
+
+        if snapshot_date_str is not None and not file_prefix:
+            df = df.filter(F.col("snapshot_date") == snapshot_date_str)
+
+        partition_col = table_config["partition_col"]
+        output_path = os.path.join(bronze_path, table_config["table_dir"])
+
+        writer = df.write.format("delta").option("mergeSchema", "true")
+        if snapshot_date_str is not None:
+            writer.partitionBy(partition_col).mode("overwrite").option("replaceWhere", f"snapshot_date = '{snapshot_date_str}'").save(output_path)
+        else:
+            writer.mode("overwrite").save(output_path)
+
+        logger.info(f"Processed {table_name} for {snapshot_date_str}. Bronze table written to {output_path}")
+
+    except Exception as e:
+        logger.error(e)
+
+
 for dataset_name in LANDING:
     if dataset_name == "path":
         continue
@@ -110,5 +117,6 @@ for dataset_name in LANDING:
         for table_name, table_config in bronze_tables.items():
             logger.debug(f"Bronze [{dataset_name}]: {table_name} @ {date_str}")
             process_bronze_table(table_name, table_config, source_path, bronze_path, spark, date_str, file_prefix, filename)
+
 
 logger.info("Bronze ingest complete")
