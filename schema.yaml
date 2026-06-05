@@ -43,5 +43,5 @@ silver:
 gold:
   path: "s3a://cs611-project/gold"
   tables:
-    sample_gold:
-      path: sample_gold
+    features_ngram_tfidf:
+      path: features_ngram_tfidf
