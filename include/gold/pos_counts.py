@@ -1,30 +1,23 @@
 """
-Gold layer: POS-tagged lemma counts for legal documents.
+gold POS counts for the legal corpus.
 
-Reads cleaned legal text, runs spaCy POS tagging, and writes a Delta table
-with per-document lemma counts grouped by POS tag. Downstream consumers
-(Yuhui's DP/DC, noun-only feature pipelines, anyone wanting verbs or
-adjectives) read this single table and filter to the POS tags they need.
+reads legal bronze, runs spaCy POS tagging, writes lemma counts grouped by
+POS tag to gold. anyone downstream (Yuhui's DP/DC, noun-only stuff, whatever)
+just reads this and filters to the POS tags they need.
 
-Output schema:
-    document_id      string                                         CELEX id
-    labels           string                                         raw multi-label string
-    snapshot_date    string                                         partition key
-    pos_counts       map<string, map<string, int>>                  pos_tag -> {lemma: count}
-    n_unique_tokens  int                                            distinct (lemma, pos) pairs
-    n_total_tokens   int                                            sum of all token occurrences
+schema:
+  document_id, labels, snapshot_date
+  pos_counts: {pos_tag: {lemma: count}}    e.g. {"NOUN": {"sample": 29, ...}, "VERB": {...}}
+  n_unique_tokens, n_total_tokens
 
-Example access pattern (noun extraction for DP/DC):
-    nouns = {**row.pos_counts.get("NOUN", {}),
-             **row.pos_counts.get("PROPN", {})}
+to pull nouns + proper nouns (the DP/DC use case):
+  nouns = {**row.pos_counts.get("NOUN", {}), **row.pos_counts.get("PROPN", {})}
 
-Implementation notes:
-    - Uses a regular Python UDF (NOT pandas_udf / mapInPandas) to sidestep
-      Apache Arrow + Java 17 compatibility issues.
-    - spaCy is lazy-loaded once per Python worker via a module-level singleton,
-      then reused across every row that worker processes.
-    - We disable spaCy's parser and ner components since we only need POS.
-    - Text is truncated to 500k chars before tagging to bound per-row memory.
+notes:
+  - regular UDF instead of pandas_udf, otherwise arrow blows up on java 17
+  - spacy loaded once per python worker (module-level singleton)
+  - parser and ner disabled, we only need POS
+  - text capped at 500k chars before tagging to keep python worker memory bounded
 """
 import argparse
 import logging
@@ -36,9 +29,6 @@ from pyspark.sql.types import IntegerType, MapType, StringType, StructField, Str
 
 from utils.spark_session import create_spark_session
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts")
 parser.add_argument(
     "--log-level",
@@ -66,9 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# load schema config
 with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
@@ -84,9 +72,7 @@ OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['pos_counts']
 logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
 logger.info(f"Output (gold)             : {OUTPUT_PATH}")
 
-# ---------------------------------------------------------------------------
-# UDF output type: pos_counts (nested map) + two convenience counts
-# ---------------------------------------------------------------------------
+# UDF output: pos_counts nested map + two count fields
 UDF_RETURN_TYPE = StructType(
     [
         StructField(
@@ -100,7 +86,7 @@ UDF_RETURN_TYPE = StructType(
 )
 
 
-# Lazy module-level spaCy singleton. Loaded once per Python worker process.
+# lazy spacy singleton, loaded once per python worker
 _NLP = None
 
 
@@ -110,8 +96,8 @@ def _get_nlp():
         import spacy
 
         _NLP = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-        # Default 1M chars is too small for the largest EurLex docs.
-        # Since parser/ner are disabled, bumping is safe.
+        # default is 1M chars, some eurlex docs are bigger so bump it.
+        # safe to do since parser/ner are off
         _NLP.max_length = 5_000_000
     return _NLP
 
@@ -125,14 +111,14 @@ def _extract_pos_counts(text):
 
     nlp = _get_nlp()
 
-    # Defensive: cap at spaCy's max_length in case Spark-level truncation missed.
+    # belt and braces: cap again in case spark-level truncation missed something
     if len(text) > nlp.max_length:
         text = text[: nlp.max_length]
 
     try:
         doc = nlp(text)
 
-        # Group lemma counts by POS tag.
+        # group lemma counts by POS tag
         pos_counts = {}
         for token in doc:
             if not token.is_alpha:
@@ -145,7 +131,7 @@ def _extract_pos_counts(text):
         n_unique = sum(len(b) for b in pos_counts.values())
         n_total = sum(sum(b.values()) for b in pos_counts.values())
     except Exception:
-        # Any per-document failure: empty result, don't fail the whole job.
+        # one bad doc shouldn't kill the whole job
         return empty
 
     return {
@@ -158,16 +144,14 @@ def _extract_pos_counts(text):
 extract_pos_counts_udf = F.udf(_extract_pos_counts, returnType=UDF_RETURN_TYPE)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     spark = create_spark_session("gold-pos-counts")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
 
-    # Cap text length at Spark level to bound per-row memory cost.
-    # ~75k words covers everything past the p95 of the corpus.
+    # truncate doc text at spark level. 500k chars is well past p95 of the
+    # corpus, so we lose ~nothing from real docs but cap the python worker
+    # memory on outliers (some eurlex docs are 1.5M+ chars)
     MAX_TEXT_CHARS = 500_000
 
     df = raw.select(
@@ -181,8 +165,8 @@ def main():
         df = df.limit(args.limit)
         logger.info(f"Smoke test mode: limited to {args.limit:,} rows")
 
-    # Repartition by snapshot_date so the shuffle aligns with partitionBy
-    # on write, keeping output file count manageable.
+    # repartition by snapshot_date so the shuffle lines up with partitionBy
+    # on write. otherwise you'd end up with way too many small files in R2
     df = df.repartition(200, "snapshot_date")
 
     input_count = df.count()
@@ -191,6 +175,7 @@ def main():
         f"{df.rdd.getNumPartitions()} partitions"
     )
 
+    # run the udf, then flatten the struct cols back to top-level
     result = (
         df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
           .select(

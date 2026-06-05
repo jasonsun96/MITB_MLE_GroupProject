@@ -1,22 +1,17 @@
 """
-Gold layer: POS-tagged lemma counts for the wiki (non-law baseline) corpus.
+gold POS counts for the wiki (non-law baseline) corpus.
 
-Mirror of include/gold/pos_counts.py but adapted to the wiki bronze schema:
-    - id column is `id` (not CELEX)
-    - text column is `text` (not act_raw_text)
-    - no `labels` column yet (labels will be added by a teammate later)
-    - no `snapshot_date` column (single-snapshot dataset)
+same idea as pos_counts.py but reading from wiki bronze instead. wiki has
+a different schema so a few column tweaks:
+  - id column is `id` (legal uses CELEX)
+  - text column is `text` (legal uses act_raw_text)
+  - no labels column yet, Cheewei is adding them. for now we write null
+  - no snapshot_date so no partitionBy on write
 
-Output schema (same shape as legal gold for symmetry):
-    document_id      string                                         wiki id
-    labels           string                                         null until labels are added upstream
-    pos_counts       map<string, map<string, int>>                  pos_tag -> {lemma: count}
-    n_unique_tokens  int                                            distinct (lemma, pos) pairs
-    n_total_tokens   int                                            sum of token occurrences
-
-When wiki labels are added to bronze later, re-running this script will
-populate the labels column. Until then, downstream consumers (DP/DC, etc)
-should filter out rows where labels IS NULL.
+output schema kept parallel to the legal gold table so downstream code can
+treat them the same. once wiki labels exist in bronze, re-run this script
+and the labels column will populate. until then filter WHERE labels IS NOT
+NULL before doing anything supervised.
 """
 import argparse
 import logging
@@ -28,9 +23,6 @@ from pyspark.sql.types import IntegerType, MapType, StringType, StructField, Str
 
 from utils.spark_session import create_spark_session
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts (wiki)")
 parser.add_argument(
     "--log-level",
@@ -58,9 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# load schema config
 with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
@@ -74,9 +64,7 @@ OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['pos_counts_w
 logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
 logger.info(f"Output (gold)             : {OUTPUT_PATH}")
 
-# ---------------------------------------------------------------------------
-# UDF output type
-# ---------------------------------------------------------------------------
+# UDF output: pos_counts nested map + two count fields
 UDF_RETURN_TYPE = StructType(
     [
         StructField(
@@ -90,7 +78,7 @@ UDF_RETURN_TYPE = StructType(
 )
 
 
-# Lazy module-level spaCy singleton. Loaded once per Python worker process.
+# lazy spacy singleton, loaded once per python worker
 _NLP = None
 
 
@@ -100,7 +88,7 @@ def _get_nlp():
         import spacy
 
         _NLP = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-        _NLP.max_length = 5_000_000
+        _NLP.max_length = 5_000_000  # default 1M is too small, bumping is safe with parser/ner off
     return _NLP
 
 
@@ -131,6 +119,7 @@ def _extract_pos_counts(text):
         n_unique = sum(len(b) for b in pos_counts.values())
         n_total = sum(sum(b.values()) for b in pos_counts.values())
     except Exception:
+        # one bad doc shouldn't kill the whole job
         return empty
 
     return {
@@ -143,21 +132,17 @@ def _extract_pos_counts(text):
 extract_pos_counts_udf = F.udf(_extract_pos_counts, returnType=UDF_RETURN_TYPE)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     spark = create_spark_session("gold-pos-counts-wiki")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
 
-    # Cap text length at Spark level to bound per-row memory.
+    # cap text at 500k chars to bound python worker memory (same reason as legal)
     MAX_TEXT_CHARS = 500_000
 
-    # Note the column mapping differences from legal:
-    #   wiki bronze has `id` (not CELEX), `text` (not act_raw_text), and
-    #   no labels / snapshot_date columns. We synthesise nullable placeholders
-    #   so the output schema stays parallel to the legal gold table.
+    # wiki bronze columns are id / text only. no labels, no snapshot_date yet.
+    # we still write labels as a null column so the schema matches legal gold,
+    # makes downstream code easier when reading both
     df = raw.select(
         F.col("id").alias("document_id"),
         F.substring(F.col("text"), 1, MAX_TEXT_CHARS).alias("text"),
@@ -168,7 +153,7 @@ def main():
         df = df.limit(args.limit)
         logger.info(f"Smoke test mode: limited to {args.limit:,} rows")
 
-    # No snapshot_date to align on for wiki, so just repartition flat.
+    # no snapshot_date on wiki, so just flat repartition
     df = df.repartition(200)
 
     input_count = df.count()
