@@ -48,3 +48,5 @@ gold:
     pos_counts:
       path: pos_counts
       partition_col: snapshot_date
+    pos_counts_wiki:
+      path: pos_counts_wiki

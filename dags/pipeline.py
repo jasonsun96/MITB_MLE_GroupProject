@@ -53,5 +53,15 @@ with DAG(
         docker_url="unix://var/run/docker.sock",
     )
 
+    extract_pos_counts_wiki = DockerOperator(
+        task_id="extract_pos_counts_wiki",
+        image=IMAGE_NAME,
+        command="python include/gold/wiki_pos_counts.py",
+        environment=R2_ENV,
+        auto_remove="force",
+        docker_url="unix://var/run/docker.sock",
+    )
+
     ingest_bronze >> process_silver >> process_gold
     ingest_bronze >> extract_pos_counts
+    ingest_bronze >> extract_pos_counts_wiki
