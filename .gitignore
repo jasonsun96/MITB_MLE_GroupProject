@@ -1,3 +1,7 @@
+# Linux/container trash directory (created when files are deleted via the cowork harness)
+.Trash-0/
+.Trash-*/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

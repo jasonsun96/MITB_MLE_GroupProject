@@ -59,10 +59,41 @@ dags/pipeline.py              Airflow DAG
 include/bronze/               Bronze ingestion jobs
 include/silver/               Silver processing jobs
 include/gold/                 Gold processing jobs
+notebooks/                    Jupyter notebooks for exploration and prototyping
 utils/spark_session.py        Spark + Delta + R2 session helper
 schema.yaml                   Table paths and layer configuration
 Dockerfile                    Runtime image used by DAG tasks
 docker-compose.yml            Local Airflow stack
+```
+
+## Jupyter Notebook
+
+A JupyterLab server runs alongside Airflow inside the same `document_topic_tagger` image, so notebooks have full access to PySpark, Delta Lake, and R2 credentials.
+
+Start the stack as usual (`docker compose up`) and open:
+
+```text
+http://localhost:8888
+```
+
+By default no token is required (the port is bound to `127.0.0.1` only). To require a token, set `JUPYTER_TOKEN` in your `.env` file. The notebook working directory is the project root, so any file under `notebooks/` is editable from both the browser and your local filesystem. New notebooks should be saved under `notebooks/`.
+
+Inside a notebook you can use the shared Spark session helper exactly as the pipeline jobs do:
+
+```python
+from utils.spark_session import create_spark_session
+
+spark = create_spark_session("notebook-exploration")
+df = spark.read.format("delta").load("s3a://cs611-project/bronze/legal_docs_raw")
+df.printSchema()
+df.show(5, truncate=120)
+```
+
+To rebuild the image after adding dependencies to `requirements.txt`:
+
+```bash
+docker compose build document-topic-tagger
+docker compose up -d jupyter
 ```
 
 ## Add A Silver Job

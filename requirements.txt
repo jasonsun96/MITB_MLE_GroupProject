@@ -2,3 +2,11 @@ pyspark==3.5.4
 delta-spark==3.2.1
 pyyaml>=6.0
 python-dotenv>=1.0
+jupyterlab>=4.2
+ipykernel>=6.29
+pandas>=2.0
+matplotlib>=3.7
+langdetect>=1.0.9
+spacy>=3.7,<3.8
+click>=8.1  # spaCy 3.7 imports from click directly but doesn't pin it; add explicitly
+pyarrow>=10.0  # required for Spark pandas UDFs / mapInPandas

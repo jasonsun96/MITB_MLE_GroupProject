@@ -45,3 +45,6 @@ gold:
   tables:
     sample_gold:
       path: sample_gold
+    pos_counts:
+      path: pos_counts
+      partition_col: snapshot_date
