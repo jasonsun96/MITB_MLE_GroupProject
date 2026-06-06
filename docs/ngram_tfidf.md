@@ -86,13 +86,20 @@ If present, `Date_document` and `Date_publication` are parsed and formatted as `
 
 ### Tokenization
 
-Text is tokenized using `utils/text_preprocess.py` (`preprocess_tokens`), which:
+Text is tokenized using `utils/text_preprocess.py` in **two steps**. The gold job chains both inside a Spark UDF (`_preprocess_tokens_for_gold` in `utils/ngram_tfidf.py`).
 
-1. Lowercases text and extracts alphanumeric tokens.
+**Step A — `preprocess_tokens_base(text)`**
+
+1. Lowercases text and extracts alphanumeric tokens (`raw_tokenize`).
 2. Removes English stopwords (NLTK).
 3. Lemmatizes tokens (NLTK WordNet).
-4. Drops single-character alphabetic tokens.
-5. Drops pure numbers except 4-digit years (e.g. keeps `2019`, drops `5`).
+
+**Step B — `filter_token_noise(tokens)`**
+
+1. Drops single-character alphabetic tokens (e.g. `e`, `p`).
+2. Drops pure numbers except 4-digit years (keeps `2019`, drops `5`, `276`).
+
+`preprocess_tokens(text)` composes both steps: `filter_token_noise(preprocess_tokens_base(text))`.
 
 Priority for token input:
 
@@ -200,11 +207,39 @@ include/gold/
 
 utils/
   ngram_tfidf.py            # prepare_silver_data, build_gold_features, save_gold_artifacts
-  text_preprocess.py        # NLTK tokenization used by the gold job
+  text_preprocess.py        # preprocess_tokens_base, filter_token_noise, preprocess_tokens
   spark_session.py          # Spark + Delta + R2 connection
+
+notebooks/
+  eda.ipynb                 # Bronze EDA (quality checks + token frequency analysis)
 
 schema.yaml                 # Table paths for silver and gold layers
 ```
+
+---
+
+## Bronze EDA (`notebooks/eda.ipynb`)
+
+Interactive exploratory analysis on bronze `legal_docs_raw` (and a preview of `wiki_docs_raw`). Run via Docker Jupyter:
+
+```bash
+docker compose run --rm -p 8888:8888 -v "${PWD}:/app" document-topic-tagger bash -lc \
+  "pip install -q jupyter && jupyter notebook --ip=0.0.0.0 --port=8888 --allow-root --no-browser --notebook-dir=/app/notebooks"
+```
+
+| Section | What it checks |
+|---------|----------------|
+| 1 | Missing `CELEX`, `act_raw_text`, or `labels` |
+| 2 | Duplicate `CELEX` values |
+| 3 | Label distribution |
+| 4 | Document length (characters / words) |
+| 5 | Top raw tokens (lowercase alphanumeric, no stopword removal) |
+| 6a | Top tokens after `preprocess_tokens_base` (stopwords removed + lemmatized) |
+| 6b | Top tokens after `filter_token_noise` (1-char letters and non-year digits removed) |
+
+Sections 6a and 6b use inline Spark UDF copies of `utils/text_preprocess.py` (workers cannot import the local `utils` package). Section 6b matches the tokenization used by the gold job.
+
+Token frequency cells sample 10% of non-empty documents to avoid Spark OOM on full-text tokenization.
 
 ---
 
@@ -240,7 +275,7 @@ Requires R2 credentials in the environment and an existing silver Delta table at
 | Aspect | Silver | Gold |
 |--------|--------|------|
 | Purpose | Cleaned document storage | ML-ready feature vectors |
-| Text | Raw or lightly processed | Tokenized, stopword-removed, lemmatized |
+| Text | Raw or lightly processed | Tokenized (stopword-removed, lemmatized, noise-filtered) |
 | Structure | One row per document (flat columns) | Same rows + sparse vector columns |
 | Features | None | N-gram counts + TF-IDF weights |
 | Artifacts | Delta table only | Delta table + vocab JSON + metadata JSON |

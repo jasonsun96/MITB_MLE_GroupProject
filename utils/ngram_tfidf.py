@@ -7,10 +7,11 @@ from pyspark.ml.feature import CountVectorizer, IDF
 from pyspark.sql import functions as F
 from pyspark.sql.types import ArrayType, StringType
 
-from utils.text_preprocess import preprocess_tokens
+from utils.text_preprocess import filter_token_noise, preprocess_tokens_base
 
 logger = logging.getLogger(__name__)
 
+# unigrams config
 MIN_N = 1
 MAX_N = 3
 MAX_FEATURES = 50_000
@@ -22,8 +23,8 @@ TOKENS_COLUMN = "tokens"
 DATE_COLUMNS = ("Date_document", "Date_publication")
 
 DROP_COLUMNS = (
-    "bronze_ingest_ts",
-    "bronze_source_key",
+    # "bronze_ingest_ts",
+    # "bronze_source_key",
     "Cites_links",
     "Ammends_links",
     "Eurlex_link",
@@ -32,7 +33,11 @@ DROP_COLUMNS = (
     "Oeil_link",
 )
 
-preprocess_tokens_udf = F.udf(preprocess_tokens, ArrayType(StringType()))
+def _preprocess_tokens_for_gold(text: str) -> list[str]:
+    return filter_token_noise(preprocess_tokens_base(text))
+
+
+preprocess_tokens_udf = F.udf(_preprocess_tokens_for_gold, ArrayType(StringType()))
 
 
 def _save_bytes_to_path(path: str, data: bytes, spark) -> None:

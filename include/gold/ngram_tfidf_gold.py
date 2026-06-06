@@ -38,7 +38,7 @@ GOLD_TABLES = GOLD["tables"]
 spark = create_spark_session("sample-gold")
 
 
-def sample_processing_function(silver_table_path, gold_table_path, spark):
+def process_ngram_tfidf_gold(silver_table_path, gold_table_path, spark):
     try:
         silver_df = spark.read.format("delta").load(silver_table_path)
         prepared_silver = prepare_silver_data(silver_df, silver_table_path)
@@ -66,7 +66,7 @@ def sample_processing_function(silver_table_path, gold_table_path, spark):
 
 silver_table_path = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
 gold_table_path = f"{GOLD_PATH}/{GOLD_TABLES['features_ngram_tfidf']['path']}"
-sample_processing_function(silver_table_path, gold_table_path, spark)
+process_ngram_tfidf_gold(silver_table_path, gold_table_path, spark)
 
 
 logger.info("Gold processing complete")

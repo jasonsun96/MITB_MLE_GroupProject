@@ -59,7 +59,9 @@ dags/pipeline.py              Airflow DAG
 include/bronze/               Bronze ingestion jobs
 include/silver/               Silver processing jobs
 include/gold/                 Gold processing jobs
-utils/spark_session.py        Spark + Delta + R2 session helper
+utils/                        Spark helpers, n-gram TF-IDF, text preprocessing
+notebooks/eda.ipynb           Bronze EDA (quality checks + token analysis)
+docs/ngram_tfidf.md           Silver → gold pipeline and preprocessing reference
 schema.yaml                   Table paths and layer configuration
 Dockerfile                    Runtime image used by DAG tasks
 docker-compose.yml            Local Airflow stack

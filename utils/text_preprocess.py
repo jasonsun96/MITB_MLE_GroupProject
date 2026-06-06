@@ -47,11 +47,8 @@ def raw_tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", str(text).lower())
 
 
-def preprocess_tokens(text: str) -> list[str]:
-    """
-    Lowercase, remove English stopwords, lemmatize.
-    Returns a list of tokens ready for n-gram / TF-IDF extraction.
-    """
+def preprocess_tokens_base(text: str) -> list[str]:
+    """Lowercase, remove English stopwords, lemmatize."""
     stops = _stopwords()
     lemmatizer = _lemmatizer()
     out: list[str] = []
@@ -59,21 +56,36 @@ def preprocess_tokens(text: str) -> list[str]:
     for token in raw_tokenize(text):
         if token in stops:
             continue
+        out.append(lemmatizer.lemmatize(token))
 
-        # Drop 1-char letter tokens (e, n, i, ...) — usually noise
+    return out
+
+
+def filter_token_noise(tokens: list[str]) -> list[str]:
+    """Drop 1-char letter tokens and digit-only tokens except 4-digit years."""
+    out: list[str] = []
+
+    for token in tokens:
         if len(token) == 1 and token.isalpha():
             continue
 
-        # Drop pure numbers except 4-digit years (keeps 2019, drops 000, 5, 276)
         if token.isdigit():
             if len(token) != 4:
                 continue
             out.append(token)
             continue
 
-        out.append(lemmatizer.lemmatize(token))
+        out.append(token)
 
     return out
+
+
+def preprocess_tokens(text: str) -> list[str]:
+    """
+    Full preprocessing pipeline: stopword removal + lemmatization, then noise filtering.
+    Returns a list of tokens ready for n-gram / TF-IDF extraction.
+    """
+    return filter_token_noise(preprocess_tokens_base(text))
 
 
 def preprocess_text(text: str) -> str:
