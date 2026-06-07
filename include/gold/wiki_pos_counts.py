@@ -5,13 +5,7 @@ same idea as pos_counts.py but reading from wiki bronze instead. wiki has
 a different schema so a few column tweaks:
   - id column is `id` (legal uses CELEX)
   - text column is `text` (legal uses act_raw_text)
-  - no labels column yet, Cheewei is adding them. for now we write null
-  - no snapshot_date so no partitionBy on write
-
-output schema kept parallel to the legal gold table so downstream code can
-treat them the same. once wiki labels exist in bronze, re-run this script
-and the labels column will populate. until then filter WHERE labels IS NOT
-NULL before doing anything supervised.
+  - no labels column, no snapshot_date, no partitionBy on write
 """
 import argparse
 import logging
@@ -146,7 +140,6 @@ def main():
     df = raw.select(
         F.col("id").alias("document_id"),
         F.substring(F.col("text"), 1, MAX_TEXT_CHARS).alias("text"),
-        F.lit(None).cast(StringType()).alias("labels"),
     ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
@@ -166,7 +159,6 @@ def main():
         df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
           .select(
               F.col("document_id"),
-              F.col("labels"),
               F.col("_pos.pos_counts").alias("pos_counts"),
               F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
               F.col("_pos.n_total_tokens").alias("n_total_tokens"),
