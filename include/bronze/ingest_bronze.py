@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-with open(Path(__file__).parent.parent / "schema.yaml") as f:
+with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
 LANDING = schema["landing"]
@@ -34,6 +34,31 @@ START_DATE = args.start_date or schema["backfill"]["start_date"]
 END_DATE = args.end_date or schema["backfill"]["end_date"]
 
 spark = create_spark_session("ingest_bronze")
+
+DEFAULT_CSV_READ_OPTIONS = {
+    "header": True,
+    "inferSchema": False,
+    "multiLine": True,
+    "maxCharsPerColumn": 10000000,
+    "maxColumns": 100000,
+}
+
+LEGAL_DOCS_CSV_READ_OPTIONS = {
+    **DEFAULT_CSV_READ_OPTIONS,
+    "multiLine": False,
+    "quote": '"',
+    "escape": '"',
+    "mode": "FAILFAST",
+}
+
+WIKI_DOCS_CSV_READ_OPTIONS = {
+    **DEFAULT_CSV_READ_OPTIONS,
+    "quote": '"',
+    "escape": '"',
+    "mode": "FAILFAST",
+}
+
+MERGED_CSV_RECORD_PATTERN = r"[\r\n]+\s*\"?[0-9][0-9A-Z()]{7,20},"
 
 
 def get_dates(spark, source_path, file_prefix, start_date_str, end_date_str):
@@ -63,62 +88,74 @@ def get_dates(spark, source_path, file_prefix, start_date_str, end_date_str):
     return sorted(dates)
 
 
+def write_delta_table(df, output_path, partition_col=None, snapshot_date_str=None):
+    writer = df.write.format("delta").option("mergeSchema", "true")
+    if snapshot_date_str is not None:
+        writer.partitionBy(partition_col).mode("overwrite").option("replaceWhere", f"snapshot_date = '{snapshot_date_str}'").save(output_path)
+    else:
+        writer.mode("overwrite").save(output_path)
+
+
 logger.info(f"Bronze ingest started | {START_DATE} to {END_DATE}")
 
 
-def process_bronze_table(table_name, table_config, source_path, bronze_path, spark, snapshot_date_str=None, file_prefix=None, filename=None):
-    try:
-        if file_prefix and snapshot_date_str:
-            date_nodash = snapshot_date_str.replace("-", "")
-            resolved_filename = f"{file_prefix}{date_nodash}.csv"
-        elif filename:
-            resolved_filename = filename
-        else:
-            resolved_filename = f"{table_name}.csv"
-        source_file_path = os.path.join(source_path, resolved_filename)
-        df = spark.read.csv(source_file_path, header=True, inferSchema=False, multiLine=True, maxCharsPerColumn=10000000, maxColumns=100000)
+def ingest_legal_docs(spark):
+    dataset_config = LANDING["legal_docs"]
+    table_name = "legal_docs_raw"
+    table_config = {**BRONZE_TABLES[table_name], **dataset_config["tables"][table_name]}
+    source_path = f"{LANDING_PATH}/{dataset_config['folder']}"
+    output_path = os.path.join(BRONZE_PATH, table_config["path"])
+    file_prefix = dataset_config["file_prefix"]
 
-        if snapshot_date_str is not None:
+    dates = get_dates(spark, source_path, file_prefix, START_DATE, END_DATE)
+    logger.info("[legal_docs] Discovered %s snapshots in R2", len(dates))
+
+    for snapshot_date_str in dates:
+        date_nodash = snapshot_date_str.replace("-", "")
+        source_file_path = os.path.join(source_path, f"{file_prefix}{date_nodash}.csv")
+
+        try:
+            df = spark.read.options(**LEGAL_DOCS_CSV_READ_OPTIONS).csv(source_file_path)
+            merged_records = df.filter(F.col("act_raw_text").rlike(MERGED_CSV_RECORD_PATTERN))
+            sample_ids = [row["CELEX"] for row in merged_records.select("CELEX").limit(10).collect()]
+            if sample_ids:
+                raise ValueError(f"Detected merged CSV records in {source_file_path}; " f"affected CELEX sample: {sample_ids}")
+
             df = df.withColumn("snapshot_date", F.lit(snapshot_date_str))
 
-        if snapshot_date_str is not None and not file_prefix:
-            df = df.filter(F.col("snapshot_date") == snapshot_date_str)
+            write_delta_table(df, output_path, table_config["partition_col"], snapshot_date_str)
+            logger.info("Processed %s for %s. Bronze table written to %s", table_name, snapshot_date_str, output_path)
 
-        partition_col = table_config["partition_col"]
-        output_path = os.path.join(bronze_path, table_config["path"])
-
-        writer = df.write.format("delta").option("mergeSchema", "true")
-        if snapshot_date_str is not None:
-            writer.partitionBy(partition_col).mode("overwrite").option("replaceWhere", f"snapshot_date = '{snapshot_date_str}'").save(output_path)
-        else:
-            writer.mode("overwrite").save(output_path)
-
-        logger.info(f"Processed {table_name} for {snapshot_date_str}. Bronze table written to {output_path}")
-
-    except Exception as e:
-        logger.error(e)
+        except Exception:
+            logger.exception("Failed to process %s from %s", table_name, source_file_path)
+            raise
 
 
-for dataset_name in LANDING:
-    if dataset_name == "path":
-        continue
-    source_path = f"{LANDING_PATH}/{LANDING[dataset_name]['folder']}"
-    file_prefix = LANDING[dataset_name].get("file_prefix")
-    filename = LANDING[dataset_name].get("filename")
-    bronze_path = BRONZE_PATH
-    landing_tables = LANDING[dataset_name]["tables"]
+def ingest_wiki_docs(spark):
+    dataset_config = LANDING["wiki_docs"]
+    table_name = "wiki_docs_raw"
+    table_config = {**BRONZE_TABLES[table_name], **dataset_config["tables"][table_name]}
+    source_path = f"{LANDING_PATH}/{dataset_config['folder']}"
+    source_file_path = os.path.join(source_path, dataset_config["filename"])
+    output_path = os.path.join(BRONZE_PATH, table_config["path"])
 
-    if file_prefix:
-        dates = get_dates(spark, source_path, file_prefix, START_DATE, END_DATE)
-        logger.info(f"[{dataset_name}] Discovered {len(dates)} snapshots in R2")
-    else:
-        dates = [None]
+    try:
+        df = spark.read.options(**WIKI_DOCS_CSV_READ_OPTIONS).csv(source_file_path)
+        malformed_rows = df.filter(F.col("id").isNull() | ~F.col("id").rlike(r"^\d+$") | F.col("url").isNull() | ~F.col("url").rlike(r"^https?://"))
+        sample_rows = [row.asDict() for row in malformed_rows.select("id", "url", "title").limit(10).collect()]
+        if sample_rows:
+            raise ValueError(f"Detected malformed wiki CSV rows in {source_file_path}; sample rows: {sample_rows}")
 
-    for date_str in dates:
-        for table_name, landing_table_config in landing_tables.items():
-            table_config = {**BRONZE_TABLES[table_name], **landing_table_config}
-            logger.debug(f"Bronze [{dataset_name}]: {table_name} @ {date_str}")
-            process_bronze_table(table_name, table_config, source_path, bronze_path, spark, date_str, file_prefix, filename)
+        write_delta_table(df, output_path)
+        logger.info("Processed %s. Bronze table written to %s", table_name, output_path)
+
+    except Exception:
+        logger.exception("Failed to process %s from %s", table_name, source_file_path)
+        raise
+
+
+ingest_legal_docs(spark)
+ingest_wiki_docs(spark)
 
 
 logger.info("Bronze ingest complete")
