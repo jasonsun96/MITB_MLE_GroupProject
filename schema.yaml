@@ -45,3 +45,5 @@ gold:
   tables:
     features_ngram_tfidf:
       path: features_ngram_tfidf
+    features_log_tfidf_svd:
+      path: features_log_tfidf_svd
