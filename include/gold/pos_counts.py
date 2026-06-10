@@ -1,7 +1,7 @@
 """
 gold POS counts for the legal corpus.
 
-reads legal bronze, runs spaCy POS tagging, writes lemma counts grouped by
+reads legal silver, runs spaCy POS tagging, writes lemma counts grouped by
 POS tag to gold. anyone downstream (Yuhui's DP/DC, noun-only stuff, whatever)
 just reads this and filters to the POS tags they need.
 
@@ -41,12 +41,6 @@ parser.add_argument(
     default=None,
     help="Limit to N rows for smoke testing. Omit for full corpus.",
 )
-parser.add_argument(
-    "--input-layer",
-    default="bronze",
-    choices=["bronze", "silver"],
-    help="Source layer to read from. Switch to 'silver' once it exists.",
-)
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -60,17 +54,19 @@ logger = logging.getLogger(__name__)
 with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
-if args.input_layer == "bronze":
-    INPUT_PATH = f"{schema['bronze']['path']}/{schema['bronze']['tables']['legal_docs_raw']['path']}"
-    TEXT_COL = "act_raw_text"
-else:
-    INPUT_PATH = f"{schema['silver']['path']}/{schema['silver']['tables']['legal_docs_processed']['path']}"
-    TEXT_COL = "text"
+SILVER = schema["silver"]
+SILVER_PATH = SILVER["path"]
+SILVER_TABLES = SILVER["tables"]
+GOLD = schema["gold"]
+GOLD_PATH = GOLD["path"]
+GOLD_TABLES = GOLD["tables"]
 
-OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['pos_counts']['path']}"
+INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
+OUTPUT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
+TEXT_COL    = "text"
 
-logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
-logger.info(f"Output (gold)             : {OUTPUT_PATH}")
+logger.info(f"Input  (silver): {INPUT_PATH}")
+logger.info(f"Output (gold)  : {OUTPUT_PATH}")
 
 # UDF output: pos_counts nested map + two count fields
 UDF_RETURN_TYPE = StructType(
