@@ -33,8 +33,12 @@ GOLD_TABLES = GOLD["tables"]
 
 LEGAL_POS_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
 WIKI_POS_PATH  = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
-DCW_TRAIN_PATH       = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_train']['path']}"
+DCW_TRAIN_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_train']['path']}"
 DCW_VAL_TEST_OOT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_val_test_oot']['path']}"
+
+MODEL_BANK            = schema["model_bank"]
+DCW_ARTIFACT_BUCKET   = MODEL_BANK["bucket"]
+DCW_ARTIFACT_KEY      = MODEL_BANK["features_extractor"]["dcw_score"]
 
 spark = create_spark_session("domain-concept-weight")
 
@@ -54,20 +58,19 @@ _DC_CONTRIB_SCHEMA = ArrayType(StructType([
     StructField("contrib", DoubleType()),
 ]))
 
-
-# ---- FOR DISCUSSION: how artifact should be done ----
-def save_dcw_artifact(filtered_vocab, dp, dc, score):
+def save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids):
     """
     Bundle and save the DCW scoring artefact to R2 as a pickle.
-    Saved to: cs611-project/artifacts/dcw_score.pkl
-    Contains filtered_vocab, dp, dc, score — everything needed to
-    transform val/test/oot/new data without refitting.
+    Contains filtered_vocab, dp, dc, score, and the set of train document_ids
+    the vocab was learnt from — everything needed to transform val/test/oot
+    without refitting.
     """
     artifact = {
-        "filtered_vocab": filtered_vocab,
-        "dp":             dp,
-        "dc":             dc,
-        "score":          score,
+        "filtered_vocab":    filtered_vocab,
+        "dp":                dp,
+        "dc":                dc,
+        "score":             score,
+        "train_document_ids": train_document_ids,
     }
     buf = io.BytesIO()
     pickle.dump(artifact, buf)
@@ -85,9 +88,8 @@ def save_dcw_artifact(filtered_vocab, dp, dc, score):
         config=Config(signature_version="s3v4"),
         region_name="auto",
     )
-    s3.upload_fileobj(buf, "cs611-project", "artifacts/dcw_score.pkl")
-    logger.info("DCW artefact saved to s3://cs611-project/artifacts/dcw_score.pkl")
-# ------------------------------------------------------
+    s3.upload_fileobj(buf, DCW_ARTIFACT_BUCKET, DCW_ARTIFACT_KEY)
+    logger.info(f"DCW artefact saved to s3://{DCW_ARTIFACT_BUCKET}/{DCW_ARTIFACT_KEY}")
 
 
 def load_dcw_artifact():
@@ -105,10 +107,10 @@ def load_dcw_artifact():
         region_name="auto",
     )
     buf = io.BytesIO()
-    s3.download_fileobj("cs611-project", "artifacts/dcw_score.pkl", buf)
+    s3.download_fileobj(DCW_ARTIFACT_BUCKET, DCW_ARTIFACT_KEY, buf)
     buf.seek(0)
     artifact = pickle.load(buf)
-    logger.info("DCW artefact loaded from s3://cs611-project/artifacts/dcw_score.pkl")
+    logger.info(f"DCW artefact loaded from s3://{DCW_ARTIFACT_BUCKET}/{DCW_ARTIFACT_KEY}")
     return artifact
 
 
@@ -306,10 +308,11 @@ def main():
     # val_test_oot will be further split into val/test/oot downstream.
     # ----------------------------------------------------------------
     train        = legal
-    val_test_oot = None
+    val_test_oot = None # remove OOT if not used
     # ----------------------------------------------------------------
 
-    logger.info(f"Train size: {train.count():,} rows")
+    train_document_ids = {row["document_id"] for row in train.select("document_id").collect()}
+    logger.info(f"Train size: {len(train_document_ids):,} documents")
 
     train = add_n_nouns_propn(train)
     n_nouns_propn_total = train.agg(F.sum("n_nouns_propn")).collect()[0][0]
@@ -331,9 +334,9 @@ def main():
     score = compute_score(dp, dc)
     logger.info(f"Domain score computed for {len(score):,} terms")
 
-    # ---- FOR DISCUSSION: how artifact should be done ----
-    save_dcw_artifact(filtered_vocab, dp, dc, score)
-    # ------------------------------------------------------
+    # ARTIFACT
+    save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids)
+  
 
     train_dcw = add_dcw_columns(train, score)
     logger.info(f"DCW columns added to train ({len(score):,} lemma columns)")
@@ -349,7 +352,7 @@ def main():
     output_count = spark.read.format("delta").load(DCW_TRAIN_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {DCW_TRAIN_PATH}")
 
-    if val_test_oot is not None:
+    if val_test_oot is not None: # remove OOT if not used
         artifact = load_dcw_artifact()
         val_test_oot = add_n_nouns_propn(val_test_oot)
         val_test_oot = add_n_nouns_propn_filtered(val_test_oot, artifact["filtered_vocab"])
