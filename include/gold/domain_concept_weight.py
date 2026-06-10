@@ -31,7 +31,7 @@ GOLD_TABLES = GOLD["tables"]
 LEGAL_POS_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
 WIKI_POS_PATH         = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
 DCW_TRAIN_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_train']['path']}"
-DCW_VAL_TEST_OOT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_val_test_oot']['path']}"
+DCW_VAL_TEST_OOT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_val_test_oot']['path']}" # CHANGE IF OOT NOT USED
 LABELS_PATH           = f"{GOLD_PATH}/{GOLD_TABLES['labels']['path']}"
 
 MODEL_BANK            = schema["model_bank"]
@@ -97,10 +97,10 @@ def load_dcw_artifact():
 
 def load_split_labels():
     """Load gold/labels Delta table. Returns a Spark DataFrame with document_id and category columns.
-    category values: train / val / test / oot
+    category values: train / val / test / oot 
     """
     df = spark.read.format("delta").load(LABELS_PATH)
-    logger.info(f"Split labels loaded: {df.count():,} rows")
+    logger.info(f"Split labels loaded: {df.count():,} rows")  # CHANGE IF OOT NOT USED
     return df
 
 
@@ -299,7 +299,7 @@ def main():
     logger.info(f"Loaded wiki : {wiki.count():,} rows")
 
     if args.no_split: # REMOVE WHEN DONE
-        logger.warning("--no-split: using all legal data as train, skipping val/test/oot. Smoke test only.")
+        logger.warning("--no-split: using all legal data as train, skipping val/test/oot. Smoke test only.")  # CHANGE IF OOT NOT USED
         train        = legal
         val_test_oot = None
     else:
@@ -343,7 +343,6 @@ def main():
         train_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels")
         .write.format("delta")
         .mode("overwrite")
-        .partitionBy("snapshot_date")
         .option("mergeSchema", "true")
         .save(DCW_TRAIN_PATH)
     )
@@ -359,8 +358,7 @@ def main():
             val_test_oot_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels")
             .write.format("delta")
             .mode("overwrite")
-            .partitionBy("snapshot_date")
-            .option("mergeSchema", "true")
+                .option("mergeSchema", "true")
             .save(DCW_VAL_TEST_OOT_PATH)
         )
         output_count_vto = spark.read.format("delta").load(DCW_VAL_TEST_OOT_PATH).count()

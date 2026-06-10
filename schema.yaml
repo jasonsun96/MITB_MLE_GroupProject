@@ -52,10 +52,8 @@ gold:
       path: pos_counts_wiki
     dcw_features_train:
       path: dcw_features_train
-      partition_col: snapshot_date
     dcw_features_val_test_oot:
       path: dcw_features_val_test_oot
-      partition_col: snapshot_date
     labels:
       path: labels
 
