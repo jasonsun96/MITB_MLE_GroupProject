@@ -58,7 +58,6 @@ _DC_CONTRIB_SCHEMA = ArrayType(StructType([
     StructField("contrib", DoubleType()),
 ]))
 
-# ---- FOR DISCUSSION: how artifact should be done ----
 def save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids):
     """
     Save the DCW scoring artefact as two Delta tables.
@@ -77,7 +76,6 @@ def save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids):
     spark.createDataFrame([{"document_id": d} for d in train_document_ids]) \
         .write.format("delta").mode("overwrite").save(DCW_TRAIN_DOC_IDS_PATH)
     logger.info(f"DCW train doc IDs saved to {DCW_TRAIN_DOC_IDS_PATH}")
-# ------------------------------------------------------
 
 
 def load_dcw_artifact():
