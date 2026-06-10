@@ -1,20 +1,17 @@
 import argparse
-import io
 import logging
-import os
-import pickle
 from pathlib import Path
 
-import boto3
 import pyspark.sql.functions as F
 import yaml
-from botocore.config import Config
 from pyspark.sql.types import ArrayType, DoubleType, IntegerType, LongType, MapType, StringType, StructField, StructType
 
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: domain concept weighting")
 parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+parser.add_argument("--no-split", action="store_true", help="Skip labels.pkl split — use all legal data as train. For smoke testing only.")
+parser.add_argument("--limit", type=int, default=None, help="Limit to N rows for smoke testing. Omit for full corpus.")
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -31,14 +28,17 @@ GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
 GOLD_TABLES = GOLD["tables"]
 
-LEGAL_POS_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
-WIKI_POS_PATH  = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
+LEGAL_POS_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
+WIKI_POS_PATH         = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
 DCW_TRAIN_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_train']['path']}"
 DCW_VAL_TEST_OOT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_val_test_oot']['path']}"
+LABELS_PATH           = f"{GOLD_PATH}/{GOLD_TABLES['labels']['path']}"
 
 MODEL_BANK            = schema["model_bank"]
-DCW_ARTIFACT_BUCKET   = MODEL_BANK["bucket"]
-DCW_ARTIFACT_KEY      = MODEL_BANK["features_extractor"]["dcw_score"]
+MODEL_BANK_PATH       = MODEL_BANK["path"]
+MODEL_BANK_FE         = MODEL_BANK["features_extractor"]
+DCW_SCORE_PATH        = f"{MODEL_BANK_PATH}/{MODEL_BANK_FE['dcw_score']}"
+DCW_TRAIN_DOC_IDS_PATH = f"{MODEL_BANK_PATH}/{MODEL_BANK_FE['dcw_train_doc_ids']}"
 
 spark = create_spark_session("domain-concept-weight")
 
@@ -58,60 +58,52 @@ _DC_CONTRIB_SCHEMA = ArrayType(StructType([
     StructField("contrib", DoubleType()),
 ]))
 
+# ---- FOR DISCUSSION: how artifact should be done ----
 def save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids):
     """
-    Bundle and save the DCW scoring artefact to R2 as a pickle.
-    Contains filtered_vocab, dp, dc, score, and the set of train document_ids
-    the vocab was learnt from — everything needed to transform val/test/oot
-    without refitting.
+    Save the DCW scoring artefact as two Delta tables.
+    dcw_score: one row per lemma with corpus_count, dp, dc, score.
+    dcw_train_doc_ids: one row per train document_id.
     """
-    artifact = {
-        "filtered_vocab":    filtered_vocab,
-        "dp":                dp,
-        "dc":                dc,
-        "score":             score,
-        "train_document_ids": train_document_ids,
-    }
-    buf = io.BytesIO()
-    pickle.dump(artifact, buf)
-    buf.seek(0)
+    score_rows = [
+        {"lemma": lemma, "corpus_count": int(filtered_vocab[lemma]),
+         "dp": dp[lemma], "dc": dc[lemma], "score": score[lemma]}
+        for lemma in score
+    ]
+    spark.createDataFrame(score_rows) \
+        .write.format("delta").mode("overwrite").save(DCW_SCORE_PATH)
+    logger.info(f"DCW score table saved to {DCW_SCORE_PATH}")
 
-    account_id        = os.environ["R2_ACCOUNT_ID"]
-    access_key_id     = os.environ["R2_ACCESS_KEY_ID"]
-    secret_access_key = os.environ["R2_SECRET_ACCESS_KEY"]
-
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
-        aws_access_key_id=access_key_id,
-        aws_secret_access_key=secret_access_key,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
-    s3.upload_fileobj(buf, DCW_ARTIFACT_BUCKET, DCW_ARTIFACT_KEY)
-    logger.info(f"DCW artefact saved to s3://{DCW_ARTIFACT_BUCKET}/{DCW_ARTIFACT_KEY}")
+    spark.createDataFrame([{"document_id": d} for d in train_document_ids]) \
+        .write.format("delta").mode("overwrite").save(DCW_TRAIN_DOC_IDS_PATH)
+    logger.info(f"DCW train doc IDs saved to {DCW_TRAIN_DOC_IDS_PATH}")
+# ------------------------------------------------------
 
 
 def load_dcw_artifact():
-    """Pull the frozen DCW artifact from R2 and return it as a dict."""
-    account_id        = os.environ["R2_ACCOUNT_ID"]
-    access_key_id     = os.environ["R2_ACCESS_KEY_ID"]
-    secret_access_key = os.environ["R2_SECRET_ACCESS_KEY"]
+    """Load the frozen DCW artifact from Delta tables. Returns a dict."""
+    rows = spark.read.format("delta").load(DCW_SCORE_PATH).collect()
+    filtered_vocab    = {r["lemma"]: r["corpus_count"] for r in rows}
+    dp                = {r["lemma"]: r["dp"]           for r in rows}
+    dc                = {r["lemma"]: r["dc"]           for r in rows}
+    score             = {r["lemma"]: r["score"]        for r in rows}
 
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
-        aws_access_key_id=access_key_id,
-        aws_secret_access_key=secret_access_key,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
-    buf = io.BytesIO()
-    s3.download_fileobj(DCW_ARTIFACT_BUCKET, DCW_ARTIFACT_KEY, buf)
-    buf.seek(0)
-    artifact = pickle.load(buf)
-    logger.info(f"DCW artefact loaded from s3://{DCW_ARTIFACT_BUCKET}/{DCW_ARTIFACT_KEY}")
-    return artifact
+    train_document_ids = {
+        r["document_id"]
+        for r in spark.read.format("delta").load(DCW_TRAIN_DOC_IDS_PATH).collect()
+    }
+    logger.info(f"DCW artifact loaded: {len(score):,} terms, {len(train_document_ids):,} train docs")
+    return {"filtered_vocab": filtered_vocab, "dp": dp, "dc": dc,
+            "score": score, "train_document_ids": train_document_ids}
+
+
+def load_split_labels():
+    """Load gold/labels Delta table. Returns a Spark DataFrame with document_id and category columns.
+    category values: train / val / test / oot
+    """
+    df = spark.read.format("delta").load(LABELS_PATH)
+    logger.info(f"Split labels loaded: {df.count():,} rows")
+    return df
 
 
 def add_n_nouns_propn(df, pos_tags=POS_TAGS):
@@ -300,16 +292,24 @@ def main():
     legal = spark.read.format("delta").load(LEGAL_POS_PATH)
     wiki  = spark.read.format("delta").load(WIKI_POS_PATH)
 
+    if args.limit:
+        legal = legal.limit(args.limit)
+        wiki  = wiki.limit(args.limit)
+        logger.info(f"Smoke test mode: limited to {args.limit:,} rows")
+
     logger.info(f"Loaded legal: {legal.count():,} rows")
     logger.info(f"Loaded wiki : {wiki.count():,} rows")
 
-    # ----------------------------------------------------------------
-    # PLACEHOLDER: replace with actual train/val_test_oot splits.
-    # val_test_oot will be further split into val/test/oot downstream.
-    # ----------------------------------------------------------------
-    train        = legal
-    val_test_oot = None # remove OOT if not used
-    # ----------------------------------------------------------------
+    if args.no_split: # REMOVE WHEN DONE
+        logger.warning("--no-split: using all legal data as train, skipping val/test/oot. Smoke test only.")
+        train        = legal
+        val_test_oot = None
+    else:
+        labels_sdf = load_split_labels().select("document_id", "category")
+        legal = legal.join(labels_sdf, on="document_id", how="inner")
+        train        = legal.filter(F.col("category") == "train").drop("category")
+        val_test_oot = legal.filter(F.col("category") != "train").drop("category")
+        logger.info(f"Val/test/oot size: {val_test_oot.count():,} documents")
 
     train_document_ids = {row["document_id"] for row in train.select("document_id").collect()}
     logger.info(f"Train size: {len(train_document_ids):,} documents")
@@ -352,7 +352,7 @@ def main():
     output_count = spark.read.format("delta").load(DCW_TRAIN_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {DCW_TRAIN_PATH}")
 
-    if val_test_oot is not None: # remove OOT if not used
+    if val_test_oot is not None: # REMOVE WHEN DONE
         artifact = load_dcw_artifact()
         val_test_oot = add_n_nouns_propn(val_test_oot)
         val_test_oot = add_n_nouns_propn_filtered(val_test_oot, artifact["filtered_vocab"])
