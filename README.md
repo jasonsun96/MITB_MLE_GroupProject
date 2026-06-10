@@ -59,7 +59,8 @@ dags/pipeline.py              Airflow DAG
 include/bronze/               Bronze ingestion jobs
 include/silver/               Silver processing jobs
 include/gold/                 Gold processing jobs
-utils/                        Spark helpers, n-gram TF-IDF, text preprocessing
+utils/                        Spark session helper
+include/gold/                 ngram_processing.py, tfidf_processing.py
 notebooks/eda.ipynb           Bronze EDA (quality checks + token analysis)
 docs/ngram_tfidf.md           Silver → gold pipeline and preprocessing reference
 schema.yaml                   Table paths and layer configuration

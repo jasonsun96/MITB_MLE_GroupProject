@@ -43,7 +43,20 @@ silver:
 gold:
   path: "s3a://cs611-project/gold"
   tables:
-    features_ngram_tfidf:
-      path: features_ngram_tfidf
-    features_log_tfidf_svd:
-      path: features_log_tfidf_svd
+    ngram_count:
+      path: ngram_count
+      partition_col: snapshot_date
+    tfidf_features_train:
+      path: tfidf_features_train
+    tfidf_features_val_test_oot:
+      path: tfidf_features_val_test_oot
+    labels:
+      path: labels
+
+model_bank:
+  path: "s3a://cs611-project/model_bank"
+  features_extractor:
+    tfidf:
+      path: features_extractor/tfidf
+      vocab_file: gold_vocab_1_3.json
+      meta_file: gold_meta_1_3.json
