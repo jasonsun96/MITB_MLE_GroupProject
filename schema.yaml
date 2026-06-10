@@ -56,3 +56,8 @@ gold:
     dcw_features_val_test_oot:
       path: dcw_features_val_test_oot
       partition_col: snapshot_date
+
+model_bank:
+  bucket: cs611-project
+  features_extractor:
+    dcw_score: model_bank/features_extractor/dcw_score.pkl
