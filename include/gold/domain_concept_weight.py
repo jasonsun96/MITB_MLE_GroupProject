@@ -258,9 +258,9 @@ def add_n_nouns_propn_filtered(df, filtered_vocab, pos_tags=POS_TAGS):
 
 def add_dcw_columns(df, score, pos_tags=POS_TAGS):
     """
-    Add one column per lemma in score: dcw_{lemma} = freq(t in doc) * score[t].
-    Lemmas absent from a document get 0.0.
-    Computed via a single UDF pass to avoid O(vocab) plan nodes.
+    Add a single dcw_features map column: {lemma -> freq(t in doc) * score[t]}.
+    Only lemmas present in the document are stored (sparse). Lemmas absent from
+    a document are simply not in the map (treat missing keys as 0.0 downstream).
     """
     score_bc = spark.sparkContext.broadcast(score)
 
@@ -276,14 +276,7 @@ def add_dcw_columns(df, score, pos_tags=POS_TAGS):
         return result
 
     map_udf = F.udf(compute_dcw_map, MapType(StringType(), DoubleType()))
-    df = df.withColumn("_dcw_map", map_udf(F.col("pos_counts")))
-
-    existing = [F.col(c) for c in df.columns if c != "_dcw_map"]
-    dcw_cols = [
-        F.coalesce(F.col("_dcw_map")[lemma], F.lit(0.0)).alias(f"dcw_{lemma}")
-        for lemma in score
-    ]
-    return df.select(existing + dcw_cols)
+    return df.withColumn("dcw_features", map_udf(F.col("pos_counts")))
 
 
 def main():
@@ -337,7 +330,7 @@ def main():
   
 
     train_dcw = add_dcw_columns(train, score)
-    logger.info(f"DCW columns added to train ({len(score):,} lemma columns)")
+    logger.info(f"DCW features map column added to train (vocab size: {len(score):,} lemmas)")
 
     (
         train_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels")
