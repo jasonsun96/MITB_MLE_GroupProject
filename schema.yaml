@@ -50,11 +50,26 @@ gold:
       path: tfidf_features_train
     tfidf_features_val_test_oot:
       path: tfidf_features_val_test_oot
+    dcw_features_train:
+      path: dcw_features_train
+    dcw_features_val_test_oot:
+      path: dcw_features_val_test_oot
+    pos_counts:
+      path: pos_counts
+      partition_col: snapshot_date
+    embeddings:
+      path: embeddings
     labels:
       path: labels
+    model_prediction:
+      path: model_prediction
+    runs:
+      path: runs
 
 model_bank:
   path: "s3a://cs611-project/model_bank"
+  runs:
+    path: runs
   features_extractor:
     tfidf:
       path: features_extractor/tfidf
