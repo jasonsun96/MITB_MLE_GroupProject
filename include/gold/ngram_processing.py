@@ -30,6 +30,10 @@ import yaml
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
 
+from gold_io import bootstrap_paths
+
+bootstrap_paths()
+
 from utils.spark_session import create_spark_session
 
 MIN_N = 1

@@ -130,7 +130,7 @@ my_silver_job = DockerOperator(
 Attach it to the pipeline dependency chain:
 
 ```python
-ingest_bronze >> my_silver_job >> process_gold
+bronze_ingest >> my_silver_job >> process_gold
 ```
 
 ## Add A Gold Job
@@ -194,7 +194,7 @@ my_gold_job = DockerOperator(
 Attach it after the silver job it depends on:
 
 ```python
-process_silver >> my_gold_job
+silver_process_legal_docs >> my_gold_job
 ```
 
 ## DAG Notes
