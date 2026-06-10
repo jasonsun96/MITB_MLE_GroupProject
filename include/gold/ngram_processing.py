@@ -207,21 +207,53 @@ def main():
     if PARTITION_COL in raw.columns:
         select_exprs.insert(2, F.col(PARTITION_COL).alias(PARTITION_COL))
 
-    df = (
-        raw.select(*select_exprs)
-        .filter(F.col("_text").isNotNull() & (F.length(F.trim(F.col("_text"))) > MIN_TEXT_CHARS))
-        .filter(F.col("labels").isNotNull() & (F.length(F.col("labels")) > 0))
-        .dropDuplicates(["document_id"])
-    )
+    label_filter_raw = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
+    label_filter_selected = F.col("labels").isNotNull() & (F.length(F.col("labels")) > 0)
+    text_filter = F.col("_text").isNotNull() & (F.length(F.trim(F.col("_text"))) > MIN_TEXT_CHARS)
 
     if args.limit:
-        df = df.limit(args.limit)
-        logger.info("Smoke test mode: limited to %s rows", f"{args.limit:,}")
+        # Pick document IDs without reading act_raw_text — dropDuplicates + limit
+        # must not run after loading multi-MB text columns or the JVM OOMs.
+        id_exprs = [
+            F.col(ID_COLUMN).alias("document_id"),
+            F.col(LABEL_COLUMN).alias("labels"),
+        ]
+        if PARTITION_COL in raw.columns:
+            id_exprs.append(F.col(PARTITION_COL).alias(PARTITION_COL))
 
-    if PARTITION_COL in df.columns:
-        df = df.repartition(REPARTITION_N, PARTITION_COL)
+        doc_ids = [
+            row.document_id
+            for row in (
+                raw.select(*id_exprs)
+                .filter(label_filter_raw)
+                .dropDuplicates(["document_id"])
+                .limit(args.limit)
+                .collect()
+            )
+        ]
+        if not doc_ids:
+            raise ValueError("No documents matched smoke-test filters")
 
-    input_count = df.count()
+        logger.info("Smoke test mode: loading text for %s documents", f"{len(doc_ids):,}")
+
+        df = (
+            raw.filter(F.col(ID_COLUMN).isin(doc_ids))
+            .select(*select_exprs)
+            .filter(text_filter)
+            .filter(label_filter_selected)
+        )
+        input_count = len(doc_ids)
+    else:
+        df = (
+            raw.filter(label_filter_raw)
+            .select(*select_exprs)
+            .filter(text_filter)
+            .dropDuplicates(["document_id"])
+        )
+        if PARTITION_COL in df.columns:
+            df = df.repartition(REPARTITION_N, PARTITION_COL)
+        input_count = df.count()
+
     logger.info(
         "Processing %s documents across %s partitions",
         f"{input_count:,}",

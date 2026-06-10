@@ -43,6 +43,8 @@ services:
     image: document_topic_tagger
     build:
       context: .
+    env_file:
+      - .env
     command: ["bash", "-lc", "echo document_topic_tagger image is ready"]
 
   airflow-init:

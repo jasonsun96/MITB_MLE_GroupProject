@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pyspark.ml.feature import IDF
 from pyspark.ml.linalg import Vector, Vectors, VectorUDT
 from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
@@ -164,6 +163,23 @@ def _build_vocab_from_train(train_df, max_features: int, min_doc_freq: int) -> t
     return vocab, ngram_to_idx
 
 
+def _fit_idf_values(train_df, vocab: list[str], n_train: int) -> list[float]:
+    """Smoothed IDF matching Spark ML defaults: log((m + 1) / (d + 1))."""
+    if not vocab:
+        return []
+
+    doc_freq_rows = (
+        train_df.select("document_id", F.explode(F.map_keys(F.col("ngram_counts"))).alias("ngram"))
+        .filter(F.col("ngram").isin(vocab))
+        .dropDuplicates(["document_id", "ngram"])
+        .groupBy("ngram")
+        .agg(F.countDistinct("document_id").alias("doc_freq"))
+        .collect()
+    )
+    doc_freq = {row.ngram: row.doc_freq for row in doc_freq_rows}
+    return [math.log((n_train + 1) / (doc_freq.get(ngram, 0) + 1)) for ngram in vocab]
+
+
 def _make_map_to_vector_udf(ngram_to_idx: dict[str, int], vocab_size: int):
     idx_map = ngram_to_idx
 
@@ -244,11 +260,7 @@ def build_tfidf_artifact(train_df, max_features: int = MAX_FEATURES, min_doc_fre
     if vocab_size == 0:
         raise ValueError("Cannot fit TF-IDF artifact: train vocabulary is empty")
 
-    map_udf = _make_map_to_vector_udf(ngram_to_idx, vocab_size)
-    train_vectors = train_df.withColumn("count_vector", map_udf(F.col("ngram_counts")))
-
-    idf_model = IDF(inputCol="count_vector", outputCol="tfidf").fit(train_vectors)
-    idf_values = [float(x) for x in idf_model.idf.toArray()]
+    idf_values = _fit_idf_values(train_df, vocab, n_train)
     train_document_ids = [row.document_id for row in train_df.select("document_id").distinct().collect()]
 
     logger.info("Fitted IDF on %s train documents", f"{n_train:,}")
@@ -431,7 +443,15 @@ def main():
         n_holdout = holdout_df.count()
         logger.info("Split: %s train | %s val/test/oot", f"{n_train:,}", f"{n_holdout:,}")
 
-    artifact = build_tfidf_artifact(train_df, MAX_FEATURES, MIN_DOC_FREQ)
+    min_doc_freq = MIN_DOC_FREQ
+    if args.no_split and args.limit:
+        min_doc_freq = 1
+        logger.warning(
+            "Smoke test: using min_doc_freq=1 (production default is %s)",
+            MIN_DOC_FREQ,
+        )
+
+    artifact = build_tfidf_artifact(train_df, MAX_FEATURES, min_doc_freq)
     save_tfidf_artifact(
         artifact,
         paths,
