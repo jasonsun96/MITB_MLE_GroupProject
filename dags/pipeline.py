@@ -54,6 +54,15 @@ with DAG(
         docker_url="unix://var/run/docker.sock",
     )
 
+    build_label_store = DockerOperator(
+        task_id="build_label_store",
+        image=IMAGE_NAME,
+        command="python include/gold/label_store.py",
+        environment=R2_ENV,
+        auto_remove="force",
+        docker_url="unix://var/run/docker.sock",
+    )
+
     extract_pos_counts = DockerOperator(
         task_id="extract_pos_counts",
         image=IMAGE_NAME,
@@ -91,6 +100,7 @@ with DAG(
     )
 
     bronze_ingest >> [silver_process_legal_docs, silver_process_wiki_docs] >> process_gold
+    silver_process_legal_docs >> build_label_store
     bronze_ingest >> extract_pos_counts
     bronze_ingest >> extract_pos_counts_wiki
     bronze_ingest >> extract_legal_embeddings
