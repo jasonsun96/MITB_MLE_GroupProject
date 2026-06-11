@@ -44,7 +44,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--input-layer",
-    default="bronze",
+    default="silver",
     choices=["bronze", "silver"],
 )
 args = parser.parse_args()
@@ -62,10 +62,10 @@ with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
 
 if args.input_layer == "bronze":
     INPUT_PATH = f"{schema['bronze']['path']}/{schema['bronze']['tables']['legal_docs_raw']['path']}"
-    TEXT_COL = "act_raw_text"
 else:
     INPUT_PATH = f"{schema['silver']['path']}/{schema['silver']['tables']['legal_docs_processed']['path']}"
-    TEXT_COL = "text"
+# silver passes through bronze's column names, so still act_raw_text for both
+TEXT_COL = "act_raw_text"
 
 OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['embeddings']['path']}"
 
@@ -91,20 +91,25 @@ UDF_RETURN_TYPE = StructType(
 # lazy singletons, loaded once per python worker
 _TOKENIZER = None
 _MODEL = None
+_DEVICE = None
 
 
 def _get_model():
-    global _TOKENIZER, _MODEL
+    global _TOKENIZER, _MODEL, _DEVICE
     if _MODEL is None:
         import torch
         from transformers import AutoModel, AutoTokenizer
 
+        # use GPU when the container has one (--gpus / compose device
+        # reservation), otherwise plain CPU. teammates without nvidia
+        # hardware run the exact same code path.
+        _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         _TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _MODEL = AutoModel.from_pretrained(MODEL_NAME)
+        _MODEL = AutoModel.from_pretrained(MODEL_NAME).to(_DEVICE)
         _MODEL.eval()
         # disable autograd, we're only doing inference
         torch.set_grad_enabled(False)
-    return _TOKENIZER, _MODEL
+    return _TOKENIZER, _MODEL, _DEVICE
 
 
 def _embed_document(text):
@@ -116,7 +121,7 @@ def _embed_document(text):
 
     import torch
 
-    tokenizer, model = _get_model()
+    tokenizer, model, device = _get_model()
 
     # tokenize the whole doc, no special tokens (we add them per chunk)
     token_ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
@@ -147,8 +152,8 @@ def _embed_document(text):
         input_ids_batch.append(ids + [pad_id] * pad_n)
         attention_mask_batch.append([1] * len(ids) + [0] * pad_n)
 
-    input_ids = torch.tensor(input_ids_batch)
-    attention_mask = torch.tensor(attention_mask_batch)
+    input_ids = torch.tensor(input_ids_batch, device=device)
+    attention_mask = torch.tensor(attention_mask_batch, device=device)
 
     try:
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -160,7 +165,7 @@ def _embed_document(text):
         counts = mask.sum(dim=1).clamp(min=1)
         chunk_vectors = summed / counts          # (n_chunks, 768)
         # average across chunks
-        doc_vector = chunk_vectors.mean(dim=0)   # (768,)
+        doc_vector = chunk_vectors.mean(dim=0).cpu()   # (768,) back to host
         return {
             "embedding": doc_vector.tolist(),
             "embedding_model": MODEL_NAME,
