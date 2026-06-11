@@ -13,85 +13,77 @@ R2_ENV = {
     "PYTHONPATH": "/app",
 }
 
+COMMON = dict(
+    image=IMAGE_NAME,
+    environment=R2_ENV,
+    auto_remove="force",
+    docker_url="unix://var/run/docker.sock",
+)
+
 with DAG(
     dag_id="medallion_pipeline",
     start_date=datetime.datetime(2024, 1, 1),
     schedule="@monthly",
 ):
+    # ---- bronze ----
     bronze_ingest = DockerOperator(
         task_id="ingest_bronze",
-        image=IMAGE_NAME,
         command="python include/bronze/ingest_bronze.py --start-date {{ ds }} --end-date {{ ds }}",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    silver_process_legal_docs = DockerOperator(
+    # ---- silver ----
+    silver_legal = DockerOperator(
         task_id="process_silver_legal_docs",
-        image=IMAGE_NAME,
         command="python include/silver/process_legal_docs.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    silver_process_wiki_docs = DockerOperator(
+    silver_wiki = DockerOperator(
         task_id="process_silver_wiki_docs",
-        image=IMAGE_NAME,
         command="python include/silver/process_wiki_docs.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    process_gold = DockerOperator(
-        task_id="process_gold",
-        image=IMAGE_NAME,
-        command="python include/gold/sample_gold.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+    # ---- gold: per-document features (all read from silver) ----
+    gold_ngram_counts = DockerOperator(
+        task_id="extract_ngram_counts",
+        command="python include/gold/ngram_processing.py",
+        **COMMON,
     )
 
-    extract_pos_counts = DockerOperator(
+    gold_pos_counts = DockerOperator(
         task_id="extract_pos_counts",
-        image=IMAGE_NAME,
         command="python include/gold/pos_counts.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    extract_pos_counts_wiki = DockerOperator(
-        task_id="extract_pos_counts_wiki",
-        image=IMAGE_NAME,
-        command="python include/gold/wiki_pos_counts.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
-    )
-
-    extract_legal_embeddings = DockerOperator(
+    gold_legal_embeddings = DockerOperator(
         task_id="extract_legal_embeddings",
-        image=IMAGE_NAME,
         command="python include/gold/legal_embeddings.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    extract_wiki_embeddings = DockerOperator(
+    gold_pos_counts_wiki = DockerOperator(
+        task_id="extract_pos_counts_wiki",
+        command="python include/gold/wiki_pos_counts.py",
+        **COMMON,
+    )
+
+    gold_wiki_embeddings = DockerOperator(
         task_id="extract_wiki_embeddings",
-        image=IMAGE_NAME,
         command="python include/gold/wiki_embeddings.py",
-        environment=R2_ENV,
-        auto_remove="force",
-        docker_url="unix://var/run/docker.sock",
+        **COMMON,
     )
 
-    bronze_ingest >> [silver_process_legal_docs, silver_process_wiki_docs] >> process_gold
-    bronze_ingest >> extract_pos_counts
-    bronze_ingest >> extract_pos_counts_wiki
-    bronze_ingest >> extract_legal_embeddings
-    bronze_ingest >> extract_wiki_embeddings
+    # ---- dependencies ----
+    # gold jobs read SILVER tables, so they must run after their silver task
+    bronze_ingest >> [silver_legal, silver_wiki]
+    silver_legal >> [gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
+    silver_wiki >> [gold_pos_counts_wiki, gold_wiki_embeddings]
+
+    # ---- not yet wired (blocked on gold/labels split table) ----
+    # build_labels (not implemented)        << silver_legal
+    # tfidf_processing.py                   << [gold_ngram_counts, build_labels]
+    # domain_concept_weight.py              << [gold_pos_counts, gold_pos_counts_wiki, build_labels]
+    # model_training.py                     << [tfidf, dcw, gold_legal_embeddings, build_labels]
