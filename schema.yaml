@@ -43,6 +43,8 @@ silver:
 gold:
   path: "s3a://cs611-project/gold"
   tables:
+    sample_gold:
+      path: sample_gold
     ngram_count:
       path: ngram_count
       partition_col: snapshot_date
@@ -50,13 +52,15 @@ gold:
       path: tfidf_features_train
     tfidf_features_val_test_oot:
       path: tfidf_features_val_test_oot
+    pos_counts:
+      path: pos_counts
+      partition_col: snapshot_date
+    pos_counts_wiki:
+      path: pos_counts_wiki
     dcw_features_train:
       path: dcw_features_train
     dcw_features_val_test_oot:
       path: dcw_features_val_test_oot
-    pos_counts:
-      path: pos_counts
-      partition_col: snapshot_date
     embeddings:
       path: embeddings
     labels:
@@ -75,3 +79,5 @@ model_bank:
       path: features_extractor/tfidf
       vocab_file: gold_vocab_1_3.json
       meta_file: gold_meta_1_3.json
+    dcw_score: features_extractor/dcw_score
+    dcw_train_doc_ids: features_extractor/dcw_train_doc_ids

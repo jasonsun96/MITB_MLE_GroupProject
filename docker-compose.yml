@@ -47,6 +47,35 @@ services:
       - .env
     command: ["bash", "-lc", "echo document_topic_tagger image is ready"]
 
+  jupyter:
+    image: document_topic_tagger
+    env_file:
+      - .env
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-}
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "127.0.0.1:8888:8888"
+    command:
+      - bash
+      - -lc
+      - |
+        jupyter lab \
+          --ip=0.0.0.0 \
+          --port=8888 \
+          --no-browser \
+          --allow-root \
+          --ServerApp.token="$${JUPYTER_TOKEN}" \
+          --ServerApp.password='' \
+          --ServerApp.root_dir=/app \
+          --ServerApp.allow_origin='*'
+    restart: unless-stopped
+    depends_on:
+      document-topic-tagger:
+        condition: service_completed_successfully
+
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
