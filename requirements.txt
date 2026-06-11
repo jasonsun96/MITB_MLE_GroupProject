@@ -10,3 +10,5 @@ langdetect>=1.0.9
 spacy>=3.7,<3.8
 click>=8.1  # spaCy 3.7 imports from click directly but doesn't pin it; add explicitly
 pyarrow>=10.0  # required for Spark pandas UDFs / mapInPandas
+torch>=2.0,<3.0  # CPU inference for Legal-BERT embeddings
+transformers>=4.40,<5.0  # HuggingFace, for Legal-BERT

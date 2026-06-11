@@ -52,9 +52,14 @@ def create_spark_session(app_name, log_level="ERROR"):
     SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
     R2_ENDPOINT = f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+    # Default to all cores. For memory-heavy jobs (like BERT embeddings) the
+    # caller can lower this via SPARK_MASTER=local[2] (or whatever) to reduce
+    # the number of concurrent python workers and bound RAM.
+    master = os.environ.get("SPARK_MASTER", "local[*]")
+
     builder = (
         SparkSession.builder.appName(app_name)
-        .master("local[*]")
+        .master(master)
         # Belt-and-braces: also set as Spark config in case the env-var path is ignored
         .config("spark.driver.extraJavaOptions", _JVM_OPENS)
         .config("spark.executor.extraJavaOptions", _JVM_OPENS)

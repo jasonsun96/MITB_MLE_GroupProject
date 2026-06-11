@@ -50,3 +50,8 @@ gold:
       partition_col: snapshot_date
     pos_counts_wiki:
       path: pos_counts_wiki
+    embeddings:
+      path: embeddings
+      partition_col: snapshot_date
+    embeddings_wiki:
+      path: embeddings_wiki

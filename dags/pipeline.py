@@ -62,6 +62,26 @@ with DAG(
         docker_url="unix://var/run/docker.sock",
     )
 
+    extract_legal_embeddings = DockerOperator(
+        task_id="extract_legal_embeddings",
+        image=IMAGE_NAME,
+        command="python include/gold/legal_embeddings.py",
+        environment=R2_ENV,
+        auto_remove="force",
+        docker_url="unix://var/run/docker.sock",
+    )
+
+    extract_wiki_embeddings = DockerOperator(
+        task_id="extract_wiki_embeddings",
+        image=IMAGE_NAME,
+        command="python include/gold/wiki_embeddings.py",
+        environment=R2_ENV,
+        auto_remove="force",
+        docker_url="unix://var/run/docker.sock",
+    )
+
     ingest_bronze >> process_silver >> process_gold
     ingest_bronze >> extract_pos_counts
     ingest_bronze >> extract_pos_counts_wiki
+    ingest_bronze >> extract_legal_embeddings
+    ingest_bronze >> extract_wiki_embeddings

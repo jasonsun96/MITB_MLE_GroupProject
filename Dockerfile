@@ -29,6 +29,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir \
     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
+# Pre-download Legal-BERT into the image so containers start instantly. About
+# 440 MB. Cached at /root/.cache/huggingface/hub/. Swap the model name if we
+# upgrade to a different embedding model later.
+RUN python -c "from transformers import AutoModel, AutoTokenizer; \
+    name='nlpaueb/legal-bert-base-uncased'; \
+    AutoTokenizer.from_pretrained(name); \
+    AutoModel.from_pretrained(name)"
+
 COPY . .
 
 CMD ["/bin/bash"]
