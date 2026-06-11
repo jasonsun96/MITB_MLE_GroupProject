@@ -45,6 +45,13 @@ with DAG(
         **COMMON,
     )
 
+    # ---- gold: label store (train/val/test/oot split assignment) ----
+    build_label_store = DockerOperator(
+        task_id="build_label_store",
+        command="python include/gold/label_store.py",
+        **COMMON,
+    )
+
     # ---- gold: per-document features (all read from silver) ----
     gold_ngram_counts = DockerOperator(
         task_id="extract_ngram_counts",
@@ -79,11 +86,10 @@ with DAG(
     # ---- dependencies ----
     # gold jobs read SILVER tables, so they must run after their silver task
     bronze_ingest >> [silver_legal, silver_wiki]
-    silver_legal >> [gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
+    silver_legal >> [build_label_store, gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
     silver_wiki >> [gold_pos_counts_wiki, gold_wiki_embeddings]
 
-    # ---- not yet wired (blocked on gold/labels split table) ----
-    # build_labels (not implemented)        << silver_legal
-    # tfidf_processing.py                   << [gold_ngram_counts, build_labels]
-    # domain_concept_weight.py              << [gold_pos_counts, gold_pos_counts_wiki, build_labels]
-    # model_training.py                     << [tfidf, dcw, gold_legal_embeddings, build_labels]
+    # ---- not yet wired (pending label_store/labels table + column alignment) ----
+    # tfidf_processing.py        << [gold_ngram_counts, build_label_store]
+    # domain_concept_weight.py   << [gold_pos_counts, gold_pos_counts_wiki, build_label_store]
+    # model_training.py          << [tfidf, dcw, gold_legal_embeddings, build_label_store]
