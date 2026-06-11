@@ -23,8 +23,9 @@ LABEL_STORE_TABLE = "label_store"
 ID_COLUMN = "CELEX"
 LABEL_COLUMN = "labels"
 SPLIT_COLUMN = "category"
-TEST_START_YEAR = 2003
-VALIDATION_FRACTION_OF_PRE_TEST = 2 / 9
+DEFAULT_OOT_START_YEAR = 2004
+HOLDOUT_FRACTION_OF_PRE_OOT = 3 / 10
+TEST_FRACTION_OF_HOLDOUT = 1 / 3
 DEFAULT_RANDOM_SEED = 42
 MIN_STRATIFY_LABEL_COUNT = 2
 
@@ -57,7 +58,7 @@ def parse_labels(raw_labels: str) -> list[str]:
     return sorted({label.strip().lower() for label in raw_labels.split(";") if label.strip()})
 
 
-def split_pre_test_documents(rows, random_seed: int):
+def split_pre_oot_documents(rows, random_seed: int):
     document_ids = [row.document_id for row in rows]
     parsed_labels = [parse_labels(row.labels) for row in rows]
 
@@ -72,19 +73,33 @@ def split_pre_test_documents(rows, random_seed: int):
     targets = encoder.fit_transform(stratify_targets)
     row_indexes = np.arange(len(rows)).reshape(-1, 1)
 
-    splitter = MultilabelStratifiedShuffleSplit(
+    train_holdout_splitter = MultilabelStratifiedShuffleSplit(
         n_splits=1,
-        test_size=VALIDATION_FRACTION_OF_PRE_TEST,
+        test_size=HOLDOUT_FRACTION_OF_PRE_OOT,
         random_state=random_seed,
     )
-    train_indexes, validation_indexes = next(splitter.split(row_indexes, targets))
+    train_indexes, holdout_indexes = next(train_holdout_splitter.split(row_indexes, targets))
+
+    holdout_targets = targets[holdout_indexes]
+    holdout_row_indexes = np.arange(len(holdout_indexes)).reshape(-1, 1)
+    validation_test_splitter = MultilabelStratifiedShuffleSplit(
+        n_splits=1,
+        test_size=TEST_FRACTION_OF_HOLDOUT,
+        random_state=random_seed + 1,
+    )
+    validation_relative, test_relative = next(
+        validation_test_splitter.split(holdout_row_indexes, holdout_targets)
+    )
+    validation_indexes = holdout_indexes[validation_relative]
+    test_indexes = holdout_indexes[test_relative]
 
     assignments = {document_ids[index]: "train" for index in train_indexes}
     assignments.update({document_ids[index]: "val" for index in validation_indexes})
+    assignments.update({document_ids[index]: "test" for index in test_indexes})
     return assignments, len(stratify_labels)
 
 
-def assign_splits(label_store, spark, random_seed: int):
+def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
     duplicate_ids = label_store.groupBy("document_id").count().filter(F.col("count") > 1).select("document_id").limit(10).collect()
     if duplicate_ids:
         sample = [row.document_id for row in duplicate_ids]
@@ -96,14 +111,16 @@ def assign_splits(label_store, spark, random_seed: int):
         sample = [row.snapshot_date for row in invalid_dates]
         raise ValueError(f"Invalid snapshot_date values: {sample}")
 
-    pre_test = label_store.filter(snapshot_year < TEST_START_YEAR)
-    test = label_store.filter(snapshot_year >= TEST_START_YEAR).withColumn(SPLIT_COLUMN, F.lit("test"))
+    pre_oot = label_store.filter(snapshot_year < oot_start_year)
+    oot = label_store.filter(snapshot_year >= oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
 
-    pre_test_rows = pre_test.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
-    if not pre_test_rows:
-        raise ValueError("No pre-test documents available for train/validation splitting")
+    pre_oot_rows = pre_oot.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
+    if not pre_oot_rows:
+        raise ValueError("No pre-OOT documents available for train/validation/test splitting")
 
-    assignments, stratified_label_count = split_pre_test_documents(pre_test_rows, random_seed=random_seed)
+    assignments, stratified_label_count = split_pre_oot_documents(
+        pre_oot_rows, random_seed=random_seed
+    )
     assignment_schema = T.StructType(
         [
             T.StructField("document_id", T.StringType(), nullable=False),
@@ -111,14 +128,14 @@ def assign_splits(label_store, spark, random_seed: int):
         ]
     )
     assignment_df = spark.createDataFrame(assignments.items(), schema=assignment_schema)
-    train_validation = pre_test.join(assignment_df, on="document_id", how="inner")
+    train_validation_test = pre_oot.join(assignment_df, on="document_id", how="inner")
 
     logger.info(
-        "Stratified %s labels across %s pre-test documents",
+        "Stratified %s labels across %s pre-OOT documents",
         f"{stratified_label_count:,}",
-        f"{len(pre_test_rows):,}",
+        f"{len(pre_oot_rows):,}",
     )
-    return train_validation.unionByName(test)
+    return train_validation_test.unionByName(oot)
 
 
 def main() -> None:
@@ -132,7 +149,13 @@ def main() -> None:
         "--random-seed",
         type=int,
         default=DEFAULT_RANDOM_SEED,
-        help="Random seed for the train/validation multilabel split",
+        help="Random seed for the train/validation/test multilabel split",
+    )
+    parser.add_argument(
+        "--oot-start-year",
+        type=int,
+        default=DEFAULT_OOT_START_YEAR,
+        help="First snapshot year assigned to the out-of-time set",
     )
     args = parser.parse_args()
 
@@ -156,7 +179,12 @@ def main() -> None:
     spark = create_spark_session("gold-label-store")
     silver_df = spark.read.format("delta").load(input_path)
     label_store = build_label_store(silver_df)
-    label_store = assign_splits(label_store, spark, random_seed=args.random_seed)
+    label_store = assign_splits(
+        label_store,
+        spark,
+        random_seed=args.random_seed,
+        oot_start_year=args.oot_start_year,
+    )
 
     try:
         write_delta(label_store, output_path, partition_col=PARTITION_COL)
@@ -168,3 +196,7 @@ def main() -> None:
     logger.info("Wrote %s rows to %s", f"{output_count:,}", output_path)
     label_store.groupBy(SPLIT_COLUMN).count().orderBy(SPLIT_COLUMN).show(truncate=False)
     logger.info("Gold label store extraction complete")
+
+
+if __name__ == "__main__":
+    main()
