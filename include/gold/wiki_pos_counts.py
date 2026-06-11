@@ -1,17 +1,11 @@
 """
 gold POS counts for the wiki (non-law baseline) corpus.
 
-same idea as pos_counts.py but reading from wiki bronze instead. wiki has
+same idea as pos_counts.py but reading from wiki silver instead. wiki has
 a different schema so a few column tweaks:
   - id column is `id` (legal uses CELEX)
   - text column is `text` (legal uses act_raw_text)
-  - no labels column yet, Cheewei is adding them. for now we write null
-  - no snapshot_date so no partitionBy on write
-
-output schema kept parallel to the legal gold table so downstream code can
-treat them the same. once wiki labels exist in bronze, re-run this script
-and the labels column will populate. until then filter WHERE labels IS NOT
-NULL before doing anything supervised.
+  - no labels column, no snapshot_date, no partitionBy on write
 """
 import argparse
 import logging
@@ -35,12 +29,6 @@ parser.add_argument(
     default=None,
     help="Limit to N rows for smoke testing. Omit for full corpus.",
 )
-parser.add_argument(
-    "--input-layer",
-    default="bronze",
-    choices=["bronze", "silver"],
-    help="Source layer to read from. Switch to 'silver' once it exists.",
-)
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -54,15 +42,18 @@ logger = logging.getLogger(__name__)
 with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
     schema = yaml.safe_load(f)
 
-if args.input_layer == "bronze":
-    INPUT_PATH = f"{schema['bronze']['path']}/{schema['bronze']['tables']['wiki_docs_raw']['path']}"
-else:
-    INPUT_PATH = f"{schema['silver']['path']}/{schema['silver']['tables']['wiki_docs_processed']['path']}"
+SILVER = schema["silver"]
+SILVER_PATH = SILVER["path"]
+SILVER_TABLES = SILVER["tables"]
+GOLD = schema["gold"]
+GOLD_PATH = GOLD["path"]
+GOLD_TABLES = GOLD["tables"]
 
-OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['pos_counts_wiki']['path']}"
+INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['wiki_docs_processed']['path']}"
+OUTPUT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
 
-logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
-logger.info(f"Output (gold)             : {OUTPUT_PATH}")
+logger.info(f"Input  (silver): {INPUT_PATH}")
+logger.info(f"Output (gold)  : {OUTPUT_PATH}")
 
 # UDF output: pos_counts nested map + two count fields
 UDF_RETURN_TYPE = StructType(
@@ -146,7 +137,6 @@ def main():
     df = raw.select(
         F.col("id").alias("document_id"),
         F.substring(F.col("text"), 1, MAX_TEXT_CHARS).alias("text"),
-        F.lit(None).cast(StringType()).alias("labels"),
     ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
@@ -166,7 +156,6 @@ def main():
         df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
           .select(
               F.col("document_id"),
-              F.col("labels"),
               F.col("_pos.pos_counts").alias("pos_counts"),
               F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
               F.col("_pos.n_total_tokens").alias("n_total_tokens"),
