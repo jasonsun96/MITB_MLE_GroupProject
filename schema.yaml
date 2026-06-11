@@ -66,6 +66,9 @@ gold:
       partition_col: snapshot_date
     embeddings_wiki:
       path: embeddings_wiki
+    label_store:
+      path: label_store
+      partition_col: snapshot_date
     labels:
       path: labels
     model_prediction:
