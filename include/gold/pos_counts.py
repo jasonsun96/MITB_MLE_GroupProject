@@ -63,7 +63,8 @@ GOLD_TABLES = GOLD["tables"]
 
 INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
 OUTPUT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
-TEXT_COL    = "text"
+# silver passes through bronze's column names, so still act_raw_text not text
+TEXT_COL    = "act_raw_text"
 
 logger.info(f"Input  (silver): {INPUT_PATH}")
 logger.info(f"Output (gold)  : {OUTPUT_PATH}")

@@ -46,6 +46,9 @@ services:
     env_file:
       - .env
     command: ["bash", "-lc", "echo document_topic_tagger image is ready"]
+    # GPU users: add -f docker-compose.gpu.yml to your compose commands to
+    # enable nvidia passthrough (see that file). Embedding scripts auto-detect
+    # cuda and fall back to CPU, so everyone runs the same code.
 
   jupyter:
     image: document_topic_tagger

@@ -1,0 +1,16 @@
+# Optional override: NVIDIA GPU passthrough for the project image.
+# Only use on machines with an NVIDIA GPU + driver (Docker Desktop on WSL2
+# handles the rest). Teammates without a GPU just use docker-compose.yml alone.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm \
+#     document-topic-tagger python include/gold/legal_embeddings.py
+services:
+  document-topic-tagger:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -76,7 +76,7 @@ FEATURE_SET_CHOICES = (
 )
 MODEL_TYPE = "random_forest"
 SOURCE_LABEL_COL = "label"
-EMBEDDING_COL = "embeddings"
+EMBEDDING_COL = "embedding"  # column name written by legal_embeddings.py / wiki_embeddings.py
 HOLDOUT_SPLITS = ("val", "test", "oot")
 MULTILABEL_STRATEGY = "binary_relevance"
 

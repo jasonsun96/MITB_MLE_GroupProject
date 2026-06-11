@@ -38,7 +38,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--input-layer",
-    default="bronze",
+    default="silver",
     choices=["bronze", "silver"],
 )
 args = parser.parse_args()
@@ -79,19 +79,22 @@ UDF_RETURN_TYPE = StructType(
 
 _TOKENIZER = None
 _MODEL = None
+_DEVICE = None
 
 
 def _get_model():
-    global _TOKENIZER, _MODEL
+    global _TOKENIZER, _MODEL, _DEVICE
     if _MODEL is None:
         import torch
         from transformers import AutoModel, AutoTokenizer
 
+        # use GPU when available, otherwise CPU (same code path for everyone)
+        _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         _TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
-        _MODEL = AutoModel.from_pretrained(MODEL_NAME)
+        _MODEL = AutoModel.from_pretrained(MODEL_NAME).to(_DEVICE)
         _MODEL.eval()
         torch.set_grad_enabled(False)
-    return _TOKENIZER, _MODEL
+    return _TOKENIZER, _MODEL, _DEVICE
 
 
 def _embed_document(text):
@@ -102,7 +105,7 @@ def _embed_document(text):
 
     import torch
 
-    tokenizer, model = _get_model()
+    tokenizer, model, device = _get_model()
 
     token_ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
     if not token_ids:
@@ -129,8 +132,8 @@ def _embed_document(text):
         input_ids_batch.append(ids + [pad_id] * pad_n)
         attention_mask_batch.append([1] * len(ids) + [0] * pad_n)
 
-    input_ids = torch.tensor(input_ids_batch)
-    attention_mask = torch.tensor(attention_mask_batch)
+    input_ids = torch.tensor(input_ids_batch, device=device)
+    attention_mask = torch.tensor(attention_mask_batch, device=device)
 
     try:
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -139,7 +142,7 @@ def _embed_document(text):
         summed = (hidden * mask).sum(dim=1)
         counts = mask.sum(dim=1).clamp(min=1)
         chunk_vectors = summed / counts
-        doc_vector = chunk_vectors.mean(dim=0)
+        doc_vector = chunk_vectors.mean(dim=0).cpu()
         return {
             "embedding": doc_vector.tolist(),
             "embedding_model": MODEL_NAME,
