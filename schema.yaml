@@ -63,6 +63,9 @@ gold:
       path: dcw_features_val_test_oot
     embeddings:
       path: embeddings
+      partition_col: snapshot_date
+    embeddings_wiki:
+      path: embeddings_wiki
     labels:
       path: labels
     model_prediction:
