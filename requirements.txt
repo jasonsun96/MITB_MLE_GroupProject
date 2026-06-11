@@ -1,7 +1,10 @@
 pyspark==3.5.4
 delta-spark==3.2.1
+numpy>=1.26
+setuptools>=69
 pyyaml>=6.0
 python-dotenv>=1.0
+nltk>=3.8
 jupyterlab>=4.2
 ipykernel>=6.29
 pandas>=2.0

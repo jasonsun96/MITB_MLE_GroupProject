@@ -60,7 +60,9 @@ include/bronze/               Bronze ingestion jobs
 include/silver/               Silver processing jobs
 include/gold/                 Gold processing jobs
 notebooks/                    Jupyter notebooks for exploration and prototyping
+notebooks/eda.ipynb           Bronze EDA (quality checks + token analysis)
 utils/spark_session.py        Spark + Delta + R2 session helper
+docs/ngram_tfidf.md           Silver → gold pipeline and preprocessing reference
 schema.yaml                   Table paths and layer configuration
 Dockerfile                    Runtime image used by DAG tasks
 docker-compose.yml            Local Airflow stack
