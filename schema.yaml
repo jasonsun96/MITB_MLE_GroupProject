@@ -71,6 +71,12 @@ gold:
       path: labels
     model_prediction:
       path: model_prediction
+    inference_features:
+      path: inference_features
+    batch_inference:
+      path: batch_inference
+    published_predictions:
+      path: published_predictions
     runs:
       path: runs
 
@@ -78,6 +84,10 @@ model_bank:
   path: "s3a://cs611-project/model_bank"
   runs:
     path: runs
+  aliases:
+    path: aliases
+  deployment_history:
+    path: deployment/history
   features_extractor:
     tfidf:
       path: features_extractor/tfidf
