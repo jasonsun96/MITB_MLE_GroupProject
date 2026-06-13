@@ -59,10 +59,9 @@ SILVER_PATH = SILVER["path"]
 SILVER_TABLES = SILVER["tables"]
 GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
-GOLD_TABLES = GOLD["tables"]
 
 INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
-OUTPUT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
+OUTPUT_PATH = f"{GOLD_PATH}/{GOLD['corpus']['pos_tags']['path']}"
 # silver passes through bronze's column names, so still act_raw_text not text
 TEXT_COL    = "act_raw_text"
 

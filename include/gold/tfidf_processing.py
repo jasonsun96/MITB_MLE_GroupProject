@@ -7,11 +7,11 @@ splits, and writes TF-IDF + log-TF-IDF feature tables plus model_bank artefacts.
 
 Log-TF-IDF weighting: log(tf) × (1 + log(idf)) using frozen train IDF values.
 
-Upstream:  gold/ngram_count   (run ngram_processing.py first)
+Upstream:  gold/ngrams        (run ngram_processing.py first)
 Split:      gold/labels        (document_id, category)
-Outputs:    gold/tfidf_features_train
-            gold/tfidf_features_val_test_oot
-            model_bank/features_extractor/tfidf/
+Outputs:    gold/runs/{run_id}/tfidf_train
+            gold/runs/{run_id}/tfidf_val_test_oot
+            model_bank/runs/{run_id}/feature_extractors/tfidf.pkl
 
 notes:
   - vocabulary and IDF are learned from category == "train" only
@@ -21,26 +21,25 @@ notes:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-import yaml
 from pyspark.ml.linalg import Vector, Vectors, VectorUDT
 from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
 
 from gold_io import (
     PARTITION_COL,
-    PROJECT_ROOT,
     bootstrap_paths,
     columns_with_snapshot,
-    save_bytes_to_path,
+    load_pickle,
+    save_json,
+    save_pickle,
     write_delta,
 )
+from run_paths import default_feature_run_id, resolve_feature_run_paths
 from utils.spark_session import create_spark_session
 
 bootstrap_paths()
@@ -54,10 +53,6 @@ MIN_DOC_FREQ = 2
 TRAIN_CATEGORY = "train"
 LOG_TFIDF_FORMULA = "log(tf) * (1 + log(idf))"
 
-NGRAM_INDEX_FILE = "gold_ngram_index_1_3.json"
-IDF_FILE = "gold_idf_1_3.json"
-TRAIN_DOC_IDS_FILE = "gold_train_document_ids.json"
-
 TFIDF_OUTPUT_COLUMNS = [
     "doc_index",
     "document_id",
@@ -66,22 +61,6 @@ TFIDF_OUTPUT_COLUMNS = [
     "silver_ingest_ts",
     "silver_source",
 ]
-
-
-def _load_json_from_path(path: str, spark) -> Any:
-    jvm = spark.sparkContext._jvm
-    uri = jvm.java.net.URI(path)
-    hadoop_path = jvm.org.apache.hadoop.fs.Path(path)
-    fs = jvm.org.apache.hadoop.fs.FileSystem.get(uri, spark.sparkContext._jsc.hadoopConfiguration())
-    stream = fs.open(hadoop_path)
-    reader = jvm.java.io.BufferedReader(jvm.java.io.InputStreamReader(stream))
-    lines = []
-    line = reader.readLine()
-    while line is not None:
-        lines.append(line)
-        line = reader.readLine()
-    reader.close()
-    return json.loads("".join(lines))
 
 
 def load_ngram_counts(spark, ngram_path: str, limit: int | None = None):
@@ -280,27 +259,14 @@ def build_tfidf_artifact(train_df, max_features: int = MAX_FEATURES, min_doc_fre
 def save_tfidf_artifact(
     artifact: dict,
     paths: dict[str, str],
-    artifact_paths: dict[str, str],
-    ngram_count_path: str,
+    ngrams_path: str,
     no_split: bool,
     spark,
 ) -> None:
-    save_bytes_to_path(artifact_paths["vocab"], json.dumps(artifact["vocab"]).encode("utf-8"), spark)
-    save_bytes_to_path(
-        artifact_paths["ngram_index"],
-        json.dumps(artifact["ngram_to_idx"]).encode("utf-8"),
-        spark,
-    )
-    save_bytes_to_path(artifact_paths["idf"], json.dumps(artifact["idf_values"]).encode("utf-8"), spark)
-    save_bytes_to_path(
-        artifact_paths["train_doc_ids"],
-        json.dumps(artifact["train_document_ids"]).encode("utf-8"),
-        spark,
-    )
-
     meta = {
         "gold_ingest_ts": datetime.now(timezone.utc).isoformat(),
-        "ngram_count_source": ngram_count_path,
+        "run_id": paths["run_id"],
+        "ngrams_source": ngrams_path,
         "n_train_documents": artifact["n_train_documents"],
         "n_features": artifact["vocab_size"],
         "ngram_range": [MIN_N, MAX_N],
@@ -308,17 +274,10 @@ def save_tfidf_artifact(
         "min_doc_freq": artifact["min_doc_freq"],
         "train_category": TRAIN_CATEGORY,
         "no_split": no_split,
-        "ngram_count_table": paths["ngram_count"],
+        "ngrams_table": paths["ngrams"],
         "labels_table": paths["labels"],
-        "tfidf_features_train_table": paths["tfidf_features_train"],
-        "tfidf_features_val_test_oot_table": paths["tfidf_features_val_test_oot"],
-        "model_bank": paths["model_bank"],
-        "vocab_path": artifact_paths["vocab"],
-        "ngram_index_path": artifact_paths["ngram_index"],
-        "idf_path": artifact_paths["idf"],
-        "train_document_ids_path": artifact_paths["train_doc_ids"],
-        "meta_path": artifact_paths["meta"],
-        "vocab_file": Path(artifact_paths["vocab"]).name,
+        "tfidf_train_table": paths["tfidf_train"],
+        "tfidf_val_test_oot_table": paths["tfidf_val_test_oot"],
         "counts_column": "ngram_counts",
         "tfidf_column": "tfidf",
         "log_tfidf_column": "log_tfidf",
@@ -327,28 +286,37 @@ def save_tfidf_artifact(
         "final_feature_columns": ["tfidf", "log_tfidf"],
         "partition_col": PARTITION_COL,
     }
-    save_bytes_to_path(artifact_paths["meta"], json.dumps(meta, indent=2).encode("utf-8"), spark)
-
-    logger.info("Saved TF-IDF model_bank artifacts under %s", paths["model_bank"])
-    logger.info("  vocab: %s", artifact_paths["vocab"])
-    logger.info("  ngram_index: %s", artifact_paths["ngram_index"])
-    logger.info("  idf: %s", artifact_paths["idf"])
-    logger.info("  train_document_ids: %s", artifact_paths["train_doc_ids"])
-    logger.info("  meta: %s", artifact_paths["meta"])
+    save_pickle(paths["tfidf_pkl"], {"artifact": artifact, "meta": meta}, spark)
+    logger.info("Saved TF-IDF extractor to %s", paths["tfidf_pkl"])
+    _save_tfidf_json_exports(artifact, meta, paths, spark)
 
 
-def load_tfidf_artifact(artifact_paths: dict[str, str], spark) -> dict:
-    vocab = _load_json_from_path(artifact_paths["vocab"], spark)
-    ngram_to_idx = _load_json_from_path(artifact_paths["ngram_index"], spark)
-    idf_values = _load_json_from_path(artifact_paths["idf"], spark)
-    train_document_ids = _load_json_from_path(artifact_paths["train_doc_ids"], spark)
+def _save_tfidf_json_exports(artifact: dict, meta: dict, paths: dict[str, str], spark) -> None:
+    """Human-readable JSON mirrors (monitoring / audit) alongside tfidf.pkl."""
+    json_dir = paths["tfidf_json_dir"]
+    suffix = f"{MIN_N}_{MAX_N}"
+    exports = {
+        f"gold_meta_{suffix}.json": meta,
+        f"gold_vocab_{suffix}.json": artifact["vocab"],
+        f"gold_ngram_index_{suffix}.json": artifact["ngram_to_idx"],
+        f"gold_idf_{suffix}.json": artifact["idf_values"],
+        "gold_train_document_ids.json": artifact["train_document_ids"],
+    }
+    for filename, payload in exports.items():
+        path = f"{json_dir}/{filename}"
+        save_json(path, payload, spark)
+        logger.info("Saved TF-IDF JSON export to %s", path)
 
+
+def load_tfidf_artifact(pkl_path: str, spark) -> dict:
+    bundle = load_pickle(pkl_path, spark)
+    artifact = bundle["artifact"]
     return {
-        "vocab": vocab,
-        "ngram_to_idx": ngram_to_idx,
-        "vocab_size": len(vocab),
-        "idf_values": idf_values,
-        "train_document_ids": train_document_ids,
+        "vocab": artifact["vocab"],
+        "ngram_to_idx": artifact["ngram_to_idx"],
+        "vocab_size": artifact["vocab_size"],
+        "idf_values": artifact["idf_values"],
+        "train_document_ids": artifact["train_document_ids"],
     }
 
 
@@ -374,10 +342,15 @@ def main():
         description="Gold layer: freeze TF-IDF and log(tf)×(1+log(idf)) from ngram_count"
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Feature run id (e.g. run001). Default: schema gold.runs.default_run_id.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Limit ngram_count rows for smoke testing. Omit for full corpus.",
+        help="Limit ngrams rows for smoke testing. Omit for full corpus.",
     )
     parser.add_argument(
         "--no-split",
@@ -397,37 +370,18 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    with open(PROJECT_ROOT / "schema.yaml") as f:
-        schema = yaml.safe_load(f)
+    run_id = args.run_id or default_feature_run_id()
+    paths = resolve_feature_run_paths(run_id)
 
-    gold_path = schema["gold"]["path"]
-    gold_tables = schema["gold"]["tables"]
-    tfidf_extractor = schema["model_bank"]["features_extractor"]["tfidf"]
-    extractor_base = f"{schema['model_bank']['path']}/{tfidf_extractor['path']}"
-
-    paths = {
-        "ngram_count": f"{gold_path}/{gold_tables['ngram_count']['path']}",
-        "labels": f"{gold_path}/{gold_tables['labels']['path']}",
-        "tfidf_features_train": f"{gold_path}/{gold_tables['tfidf_features_train']['path']}",
-        "tfidf_features_val_test_oot": f"{gold_path}/{gold_tables['tfidf_features_val_test_oot']['path']}",
-        "model_bank": extractor_base,
-    }
-    artifact_paths = {
-        "vocab": f"{extractor_base}/{tfidf_extractor['vocab_file']}",
-        "meta": f"{extractor_base}/{tfidf_extractor['meta_file']}",
-        "ngram_index": f"{extractor_base}/{NGRAM_INDEX_FILE}",
-        "idf": f"{extractor_base}/{IDF_FILE}",
-        "train_doc_ids": f"{extractor_base}/{TRAIN_DOC_IDS_FILE}",
-    }
-
-    logger.info("Input  (ngram_count): %s", paths["ngram_count"])
+    logger.info("Run ID              : %s", run_id)
+    logger.info("Input  (ngrams)     : %s", paths["ngrams"])
     logger.info("Input  (labels)     : %s", paths["labels"])
-    logger.info("Output (train)      : %s", paths["tfidf_features_train"])
-    logger.info("Output (holdout)    : %s", paths["tfidf_features_val_test_oot"])
-    logger.info("Model bank          : %s", paths["model_bank"])
+    logger.info("Output (train)      : %s", paths["tfidf_train"])
+    logger.info("Output (holdout)    : %s", paths["tfidf_val_test_oot"])
+    logger.info("TF-IDF extractor    : %s", paths["tfidf_pkl"])
 
     spark = create_spark_session("gold-tfidf")
-    ngrams = load_ngram_counts(spark, paths["ngram_count"], args.limit)
+    ngrams = load_ngram_counts(spark, paths["ngrams"], args.limit)
 
     if args.no_split:
         logger.warning("--no-split enabled: using all ngram_count rows as train (smoke test only)")
@@ -452,27 +406,20 @@ def main():
         )
 
     artifact = build_tfidf_artifact(train_df, MAX_FEATURES, min_doc_freq)
-    save_tfidf_artifact(
-        artifact,
-        paths,
-        artifact_paths,
-        paths["ngram_count"],
-        args.no_split,
-        spark,
-    )
+    save_tfidf_artifact(artifact, paths, paths["ngrams"], args.no_split, spark)
 
     partition_col = PARTITION_COL if PARTITION_COL in train_df.columns else None
 
     train_features = select_tfidf_output(add_tfidf_column(train_df, artifact))
     holdout_features = select_tfidf_output(add_tfidf_column(holdout_df, artifact))
 
-    write_delta(train_features, paths["tfidf_features_train"], partition_col)
-    write_delta(holdout_features, paths["tfidf_features_val_test_oot"], partition_col)
+    write_delta(train_features, paths["tfidf_train"], partition_col)
+    write_delta(holdout_features, paths["tfidf_val_test_oot"], partition_col)
 
-    train_count = spark.read.format("delta").load(paths["tfidf_features_train"]).count()
-    holdout_count = spark.read.format("delta").load(paths["tfidf_features_val_test_oot"]).count()
-    logger.info("Wrote %s rows to %s", f"{train_count:,}", paths["tfidf_features_train"])
-    logger.info("Wrote %s rows to %s", f"{holdout_count:,}", paths["tfidf_features_val_test_oot"])
+    train_count = spark.read.format("delta").load(paths["tfidf_train"]).count()
+    holdout_count = spark.read.format("delta").load(paths["tfidf_val_test_oot"]).count()
+    logger.info("Wrote %s rows to %s", f"{train_count:,}", paths["tfidf_train"])
+    logger.info("Wrote %s rows to %s", f"{holdout_count:,}", paths["tfidf_val_test_oot"])
     logger.info("TF-IDF + log-TF-IDF feature freezing complete")
 
 

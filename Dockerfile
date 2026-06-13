@@ -30,6 +30,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir \
     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
+# Bake NLTK corpora at build time. Runtime download from many Spark Python workers
+# races on the same zip and can corrupt stopwords (Bad CRC-32 / truncated header).
+RUN python -c "import nltk; \
+    nltk.download('stopwords', quiet=True); \
+    nltk.download('wordnet', quiet=True); \
+    nltk.download('omw-1.4', quiet=True); \
+    from nltk.corpus import stopwords; \
+    assert len(stopwords.words('english')) > 0"
+
 # Pre-download Legal-BERT into the image so containers start instantly. About
 # 440 MB. Cached at /root/.cache/huggingface/hub/. Swap the model name if we
 # upgrade to a different embedding model later.

@@ -47,10 +47,9 @@ SILVER_PATH = SILVER["path"]
 SILVER_TABLES = SILVER["tables"]
 GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
-GOLD_TABLES = GOLD["tables"]
 
 INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['wiki_docs_processed']['path']}"
-OUTPUT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
+OUTPUT_PATH = f"{GOLD_PATH}/{GOLD['corpus']['pos_tags_wiki']['path']}"
 
 logger.info(f"Input  (silver): {INPUT_PATH}")
 logger.info(f"Output (gold)  : {OUTPUT_PATH}")
