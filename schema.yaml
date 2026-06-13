@@ -43,8 +43,6 @@ silver:
 gold:
   path: "s3a://cs611-project/gold"
   tables:
-    sample_gold:
-      path: sample_gold
     ngram_count:
       path: ngram_count
       partition_col: snapshot_date
