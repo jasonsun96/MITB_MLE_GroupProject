@@ -34,7 +34,7 @@ gold/ngram_count      gold/tfidf_features_train     model_bank/features_extracto
 | Layer | Job script | R2 path (legal docs) |
 |-------|------------|----------------------|
 | Bronze | `include/bronze/ingest_bronze.py` | `s3a://cs611-project/bronze/legal_docs_raw` |
-| Silver | `include/silver/sample_silver.py` | `s3a://cs611-project/silver/legal_docs_processed` |
+| Silver | `include/silver/process_legal_docs.py` | `s3a://cs611-project/silver/legal_docs_processed` |
 | Gold (n-grams) | `include/gold/ngram_processing.py` | `s3a://cs611-project/gold/ngram_count` |
 | Gold (labels/split) | *(not implemented yet)* | `s3a://cs611-project/gold/labels` |
 | Gold (TF-IDF features) | `include/gold/tfidf_processing.py` | `s3a://cs611-project/gold/tfidf_features_train` |
@@ -62,7 +62,7 @@ The Airflow DAG (`dags/pipeline.py`) runs bronze → silver → gold in order. U
 | `labels` | Topic label |
 | `snapshot_date` | Partition column (optional but expected) |
 
-Silver may also contain `act_clean_text` and quality flags from `sample_silver.py`; the n-gram job currently tokenizes `act_raw_text` only.
+Silver may also contain `act_clean_text` and quality flags from `process_legal_docs.py`; the n-gram job currently tokenizes `act_raw_text` only.
 
 ### Processing steps
 
@@ -301,7 +301,7 @@ docs/ngram_tfidf.md      # This document
 docker compose build document-topic-tagger
 
 # 1. Silver (if not already done)
-docker compose run --rm document-topic-tagger python include/silver/sample_silver.py
+docker compose run --rm document-topic-tagger python include/silver/process_legal_docs.py
 
 # 2. Gold n-gram extraction
 docker compose run --rm document-topic-tagger python include/gold/ngram_processing.py
