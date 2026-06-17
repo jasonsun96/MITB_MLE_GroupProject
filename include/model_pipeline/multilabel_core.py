@@ -1,40 +1,8 @@
-"""
-Spark ML multi-label training for legal document topic classification.
-
-Consumes precomputed Gold feature tables (TF-IDF, log-TF-IDF, DCW, embeddings)
-and gold/labels. Does not refit any feature extractor.
-
-Upstream feature jobs (run separately):
-  - ngram_processing.py / tfidf_processing.py  → tfidf_features_*
-  - DCW job                           → dcw_features_*
-  - embeddings job                    → gold/embeddings
-
-Outputs per training run_id (feature tables read from --feature-run-id):
-  - gold/runs/{feature_run_id}/X_train  (+ X_val_test_oot when not --train-only)
-    Use --x-run-id to store assembled X under a different gold run without overwriting.
-  - gold/model_predictions/...            (skipped with --train-only; run inference later)
-  - model_bank/runs/{run_id}/model/{model}_{date}.pkl
-  - model_bank/runs/{run_id}/model/per_label/{label}/  (Spark ML binary models)
-
-Use --feature-set tfidf_dcw_embeddings (default) for tfidf + dcw + embeddings.
-Use --train-only to fit and save models on train only; defer val/test/oot scoring.
-Use --predict-only to load saved models and evaluate val/test/oot without retraining.
-Split holdout work with --predict-stage:
-  features  → assemble and save gold/runs/{id}/X_val_test_oot only
-  predict   → score from saved X and checkpoint prediction Delta
-  metrics   → compute metrics from checkpointed predictions
-  all       → run features, predict, and metrics in one job (default)
-
-Assumptions (static layout for now):
-  - All input/output paths are defined in schema.yaml and follow a fixed R2 layout.
-  - Train/val/test/OOT membership is frozen upstream in feature tables.
-  - gold/labels is a static snapshot; category is split metadata only.
-  - Embeddings are document-level (full corpus); joined by document_id.
-  - Re-running upstream jobs overwrites Gold tables; this script reads the current snapshot.
-"""
+"""Shared multi-label Spark ML primitives: features, scoring, metrics, I/O."""
 from __future__ import annotations
 
 import argparse
+import itertools
 import logging
 import re
 import sys
@@ -55,27 +23,34 @@ from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
 from pyspark.sql.types import ArrayType, DoubleType, StringType
 
-_TRAINING_DIR = Path(__file__).resolve().parent
-_GOLD_DIR = _TRAINING_DIR.parent / "gold"
-_PROJECT_ROOT = _TRAINING_DIR.parents[1]
-for _path in (_PROJECT_ROOT, _GOLD_DIR):
+_PIPELINE_DIR = Path(__file__).resolve().parent
+_INCLUDE_DIR = _PIPELINE_DIR.parent
+_GOLD_DIR = _INCLUDE_DIR / "gold"
+_PROJECT_ROOT = _INCLUDE_DIR.parent
+for _path in (_PROJECT_ROOT, _INCLUDE_DIR, _GOLD_DIR):
     _entry = str(_path)
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
 from gold_io import bootstrap_paths, load_bytes_from_path, load_pickle, save_json, save_pickle, write_delta
 from run_paths import (
+    default_feature_run_id,
     gold_run_table_path,
     load_schema,
+    model_bank_experiment_subdir,
+    model_bank_feature_importance_path,
+    model_bank_holdout_metrics_path,
+    model_bank_model_manifest_json_path,
     model_bank_model_manifest_path,
     model_bank_per_label_models_dir,
+    model_bank_prediction_metrics_manifest_path,
+    model_bank_threshold_sweep_path,
     model_bank_run_root,
     normalize_prediction_suffix,
     prediction_batch_name,
     prediction_delta_path,
-    prediction_manifest_path,
-    prediction_manifest_path_for_batch,
-    resolve_feature_run_paths,
+    resolve_experiment_paths,
+    resolve_training_paths,
 )
 from utils.spark_session import create_spark_session
 
@@ -99,12 +74,36 @@ FEATURE_SET_CHOICES = (
 )
 MODEL_TYPE_CHOICES = ("random_forest", "logistic_regression")
 DEFAULT_MODEL_TYPE = "random_forest"
-MODEL_TYPE = DEFAULT_MODEL_TYPE  # backward-compatible alias
 SOURCE_LABEL_COL = "label"
 SOURCE_LABEL_FALLBACK_COL = "labels"  # gold/label_store column name on R2
 EMBEDDING_COL = "embedding"  # column name written by legal_embeddings.py / wiki_embeddings.py
 HOLDOUT_SPLITS = ("val", "test", "oot")
-PREDICT_STAGES = ("features", "predict", "metrics", "all")
+PREDICT_STAGES = (
+    "features",
+    "predict",
+    "metrics",
+    "threshold_sweep",
+    "feature_importance",
+    "eval",
+    "all",
+)
+PREDICT_STAGE_ALL_DEPRECATED_MSG = (
+    "--predict-stage all is deprecated. Prefer separate jobs: "
+    "features → predict → eval (avoids OOM and matches batch_evaluate_experiments.py)."
+)
+DEFAULT_THRESHOLD_SWEEP = (
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+    0.55,
+    0.60,
+    0.65,
+    0.70,
+    0.75,
+    0.80,
+)
 MULTILABEL_STRATEGY = "binary_relevance"
 
 SPLIT_COL = "category"
@@ -117,31 +116,37 @@ EMBEDDING_VECTOR_COL = "embedding_vector"
 DCW_FEATURES_COL = "dcw_features"  # map<string,double> from domain_concept_weight.py
 DCW_VECTOR_COL = "dcw_vector"
 
-RF_PARAMS = {"numTrees": 50, "maxDepth": 10}
+RF_PARAMS = {"numTrees": 50, "maxDepth": 10, "maxBins": 32}
 LR_PARAMS = {"maxIter": 100, "regParam": 0.0, "elasticNetParam": 0.0}
+DEFAULT_LR_PARAM_GRID: dict[str, list[Any]] = {
+    "regParam": [0.0, 0.001, 0.01, 0.1, 1.0],
+    "elasticNetParam": [0.0, 0.5, 1.0],
+    "maxIter": [100],
+}
+DEFAULT_RF_PARAM_GRID: dict[str, list[Any]] = {
+    "numTrees": [50, 100],
+    "maxDepth": [8, 12, 16],
+    "maxBins": [32, 64],
+}
+GRID_SEARCH_METRIC_CHOICES = ("micro_f1", "macro_f1", "exact_match_ratio")
+DEFAULT_FEATURE_IMPORTANCE_TOP_K = 50
 
 LABEL_NORMALIZATION = "lowercase_trim_dedupe"
-
 
 def default_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-
 def _safe_label_name(label: str) -> str:
     return re.sub(r"[^\w.-]", "_", label)[:128]
-
 
 def _prob_column_name(label: str) -> str:
     return f"{PROB_COL_PREFIX}{_safe_label_name(label)}"
 
-
 def prob_columns_in_df(df: DataFrame) -> list[str]:
     return sorted(col for col in df.columns if col.startswith(PROB_COL_PREFIX))
 
-
 def label_prob_column_map(label_list: list[str]) -> dict[str, str]:
     return {label: _prob_column_name(label) for label in label_list}
-
 
 def _feature_components(feature_set: str) -> dict[str, bool]:
     """Resolve which feature blocks are required. ``all`` = log_tfidf + dcw + embeddings."""
@@ -179,18 +184,15 @@ def _feature_components(feature_set: str) -> dict[str, bool]:
     }
 
 
-def load_schema_paths(feature_run_id: str, x_run_id: str | None = None) -> dict[str, str]:
-    """Resolve gold paths: read TF-IDF/DCW from feature_run_id; X matrices from x_run_id."""
-    paths = resolve_feature_run_paths(feature_run_id)
-    assembled_id = x_run_id or feature_run_id
-    if assembled_id != feature_run_id:
-        paths = {
-            **paths,
-            "assembled_run_id": assembled_id,
-            "X_train": gold_run_table_path(assembled_id, "X_train"),
-            "X_val_test_oot": gold_run_table_path(assembled_id, "X_val_test_oot"),
-            "X_unlabelled": gold_run_table_path(assembled_id, "X_unlabelled"),
-        }
+def load_schema_paths(
+    feature_run_id: str,
+    gold_run_id: str | None = None,
+    *,
+    x_run_id: str | None = None,
+) -> dict[str, str]:
+    """Resolve gold paths: TF-IDF/DCW from feature_run_id; X matrices from gold_run_id."""
+    assembled_id = gold_run_id or x_run_id
+    paths = resolve_training_paths(feature_run_id, gold_run_id=assembled_id)
     return {
         **paths,
         "tfidf_features_train": paths["tfidf_train"],
@@ -198,6 +200,24 @@ def load_schema_paths(feature_run_id: str, x_run_id: str | None = None) -> dict[
         "dcw_features_train": paths["dcw_train"],
         "dcw_features_val_test_oot": paths["dcw_val_test_oot"],
     }
+
+
+def resolve_prediction_exp_id(args: argparse.Namespace) -> str | None:
+    if getattr(args, "exp_id", None):
+        return args.exp_id
+    if args.prediction_suffix:
+        return normalize_prediction_suffix(args.prediction_suffix) or args.prediction_suffix.strip()
+    if args.run_id:
+        return args.run_id
+    return None
+
+
+def resolve_exp_id(args: argparse.Namespace) -> str:
+    """Experiment id for model_bank/experiments/{exp_id}/."""
+    exp = resolve_prediction_exp_id(args)
+    if exp:
+        return exp
+    return default_run_id()
 
 
 def _read_delta(spark, path: str, name: str) -> DataFrame:
@@ -213,6 +233,18 @@ def load_dcw_vocab(spark, paths: dict[str, str]) -> list[str]:
     if not vocab:
         raise ValueError(f"No lemmas found in DCW score table at {score_path}")
     logger.info("DCW vocabulary size: %s", f"{len(vocab):,}")
+    return vocab
+
+
+def load_tfidf_vocab(spark, paths: dict[str, str]) -> list[str]:
+    """Frozen n-gram order from tfidf.pkl (matches tfidf / log_tfidf vector indices)."""
+    pkl_path = paths["tfidf_pkl"]
+    logger.info("Loading TF-IDF vocabulary from %s", pkl_path)
+    bundle = load_pickle(pkl_path, spark)
+    vocab = bundle["artifact"]["vocab"]
+    if not vocab:
+        raise ValueError(f"No vocabulary found in TF-IDF artifact at {pkl_path}")
+    logger.info("TF-IDF vocabulary size: %s", f"{len(vocab):,}")
     return vocab
 
 
@@ -474,86 +506,112 @@ def _list_hadoop_child_names(spark, dir_path: str) -> list[str]:
 def resolve_prediction_delta_path(
     spark,
     prediction_date: str | None = None,
+    exp_id: str | None = None,
     prediction_suffix: str | None = None,
 ) -> str:
-    """Return prediction Delta path; default is latest prediction_* folder under model_predictions."""
+    """Return prediction Delta path; default is latest under model_predictions/prediction_date=.../."""
+    if prediction_date or exp_id or prediction_suffix:
+        path = prediction_delta_path(
+            prediction_date,
+            exp_id,
+            prediction_suffix=prediction_suffix,
+        )
+        logger.info("Using prediction Delta path: %s", path)
+        return path
+
     schema = load_schema()
     gold_path = schema["gold"]["path"]
     mp = schema["gold"]["model_predictions"]
     base = f"{gold_path}/{mp['base']}"
-    prefix = mp["file_prefix"]
-    norm_suffix = normalize_prediction_suffix(prediction_suffix)
-    if prediction_date or norm_suffix:
-        batch = prediction_batch_name(prediction_date, prediction_suffix)
-        path = f"{base}/{batch}"
-        logger.info("Using prediction Delta path: %s", path)
-        return path
-    candidates = sorted(
-        name
-        for name in _list_hadoop_child_names(spark, base)
-        if name.startswith(prefix) and not name.endswith((".pkl", ".json"))
+    date_prefix = mp["date_partition_prefix"]
+    date_dirs = sorted(
+        name for name in _list_hadoop_child_names(spark, base) if name.startswith(date_prefix)
     )
-    if not candidates:
+    if not date_dirs:
         raise FileNotFoundError(
             f"No prediction Delta found under {base}. Run --predict-stage predict first."
         )
-    path = f"{base}/{candidates[-1]}"
+    latest_date_dir = f"{base}/{date_dirs[-1]}"
+    exp_dirs = sorted(
+        name
+        for name in _list_hadoop_child_names(spark, latest_date_dir)
+        if not name.endswith((".pkl", ".json"))
+    )
+    if not exp_dirs:
+        raise FileNotFoundError(f"No experiment predictions under {latest_date_dir}")
+    path = f"{latest_date_dir}/{exp_dirs[-1]}"
     logger.info("Resolved latest prediction Delta: %s", path)
     return path
 
 
-def _prediction_batch_name_from_delta_path(pred_delta_path: str) -> str | None:
-    prefix = load_schema()["gold"]["model_predictions"]["file_prefix"]
-    marker = f"/{prefix}"
-    if marker not in pred_delta_path:
+def _prediction_exp_id_from_delta_path(pred_delta_path: str) -> str | None:
+    parts = pred_delta_path.rstrip("/").split("/")
+    if not parts:
         return None
-    batch = pred_delta_path.rsplit(marker, 1)[-1]
-    return batch.split(".", 1)[0] if batch else None
+    return parts[-1] if parts[-1] and not parts[-1].endswith((".pkl", ".json")) else None
 
 
 def _prediction_batch_date_from_delta_path(pred_delta_path: str) -> str | None:
-    batch = _prediction_batch_name_from_delta_path(pred_delta_path)
-    if not batch:
-        return None
-    prefix = load_schema()["gold"]["model_predictions"]["file_prefix"]
-    body = batch[len(prefix) :] if batch.startswith(prefix) else batch
-    date_part = body.split("_", 1)[0]
-    return date_part if date_part.isdigit() and len(date_part) == 8 else None
+    date_prefix = load_schema()["gold"]["model_predictions"]["date_partition_prefix"]
+    for part in pred_delta_path.split("/"):
+        if part.startswith(date_prefix):
+            return part[len(date_prefix) :]
+    # Legacy v1: prediction_YYYYMMDD_suffix
+    legacy_prefix = "prediction_"
+    for part in pred_delta_path.split("/"):
+        if part.startswith(legacy_prefix):
+            body = part[len(legacy_prefix) :]
+            date_raw = body.split("_", 1)[0]
+            if date_raw.isdigit() and len(date_raw) == 8:
+                return f"{date_raw[:4]}-{date_raw[4:6]}-{date_raw[6:8]}"
+    return None
 
 
 def resolve_model_manifest_path(
     spark,
-    run_id: str,
+    exp_id: str,
     model_date: str | None = None,
     model_type: str | None = None,
 ) -> str:
-    model_name = model_type or load_schema()["model_bank"]["runs"].get(
+    model_name = model_type or load_schema()["model_bank"]["experiments"].get(
         "default_model_name", DEFAULT_MODEL_TYPE
     )
     if model_date:
-        return model_bank_model_manifest_path(run_id, model_name, model_date)
-    model_dir = f"{model_bank_run_root(run_id)}/{load_schema()['model_bank']['runs']['model_dir']}"
+        return model_bank_model_manifest_path(exp_id, model_name, model_date)
+    manifest_dir = model_bank_experiment_subdir(exp_id, "manifest_dir")
     candidates = sorted(
         name
-        for name in _list_hadoop_child_names(spark, model_dir)
+        for name in _list_hadoop_child_names(spark, manifest_dir)
         if name.startswith(f"{model_name}_") and name.endswith(".pkl")
     )
     if not candidates:
-        raise FileNotFoundError(f"No model manifest found under {model_dir}")
-    manifest_path = f"{model_dir}/{candidates[-1]}"
+        # Legacy v1 layout: manifest lived under model/
+        legacy_dir = f"{model_bank_run_root(exp_id)}/model"
+        if legacy_dir != manifest_dir:
+            candidates = sorted(
+                name
+                for name in _list_hadoop_child_names(spark, legacy_dir)
+                if name.startswith(f"{model_name}_") and name.endswith(".pkl")
+            )
+            if candidates:
+                manifest_path = f"{legacy_dir}/{candidates[-1]}"
+                logger.info("Resolved legacy model manifest: %s", manifest_path)
+                return manifest_path
+        raise FileNotFoundError(f"No model manifest found under {manifest_dir}")
+    manifest_path = f"{manifest_dir}/{candidates[-1]}"
     logger.info("Resolved latest model manifest: %s", manifest_path)
     return manifest_path
 
 
 def _reconstruct_manifest_from_per_label_models(
     spark,
-    run_id: str,
+    exp_id: str,
     paths: dict[str, str],
     feature_set: str,
     model_type: str = DEFAULT_MODEL_TYPE,
 ) -> dict[str, Any]:
     """Fallback when manifest .pkl on R2 is missing/corrupt; map per_label dirs to train labels."""
-    per_label_dir = model_bank_per_label_models_dir(run_id)
+    per_label_dir = model_bank_per_label_models_dir(exp_id)
     dir_names = set(_list_hadoop_child_names(spark, per_label_dir))
     if not dir_names:
         raise FileNotFoundError(f"No per-label models found under {per_label_dir}")
@@ -615,26 +673,26 @@ def _reconstruct_manifest_from_per_label_models(
 
 def load_training_manifest(
     spark,
-    run_id: str,
+    exp_id: str,
     model_date: str | None = None,
     paths: dict[str, str] | None = None,
     feature_set: str = "tfidf_dcw_embeddings",
     model_type: str = DEFAULT_MODEL_TYPE,
 ) -> tuple[dict[str, Any], str]:
-    model_name = model_type or load_schema()["model_bank"]["runs"].get(
+    model_name = model_type or load_schema()["model_bank"]["experiments"].get(
         "default_model_name", DEFAULT_MODEL_TYPE
     )
     try:
-        manifest_path = resolve_model_manifest_path(spark, run_id, model_date, model_type=model_type)
+        manifest_path = resolve_model_manifest_path(spark, exp_id, model_date, model_type=model_type)
     except FileNotFoundError:
-        per_label_dir = model_bank_per_label_models_dir(run_id)
+        per_label_dir = model_bank_per_label_models_dir(exp_id)
         if paths is None or not _list_hadoop_child_names(spark, per_label_dir):
             raise
-        manifest_path = model_bank_model_manifest_path(run_id, model_name, model_date)
+        manifest_path = model_bank_model_manifest_path(exp_id, model_name, model_date)
         logger.warning("No manifest pickle under model dir; reconstructing from %s", per_label_dir)
         return (
             _reconstruct_manifest_from_per_label_models(
-                spark, run_id, paths, feature_set, model_type=model_type
+                spark, exp_id, paths, feature_set, model_type=model_type
             ),
             manifest_path,
         )
@@ -649,7 +707,7 @@ def load_training_manifest(
             raise
         return (
             _reconstruct_manifest_from_per_label_models(
-                spark, run_id, paths, feature_set, model_type=model_type
+                spark, exp_id, paths, feature_set, model_type=model_type
             ),
             manifest_path,
         )
@@ -801,33 +859,377 @@ def resolve_model_params(args: argparse.Namespace) -> dict[str, Any]:
         params["numTrees"] = args.num_trees
     if args.max_depth is not None:
         params["maxDepth"] = args.max_depth
+    if args.max_bins is not None:
+        params["maxBins"] = args.max_bins
     return params
 
 
-def resolve_rf_params(args: argparse.Namespace) -> dict[str, int]:
-    """Backward-compatible alias for Random Forest param resolution."""
-    params = resolve_model_params(args)
-    return {k: int(v) for k, v in params.items()}
+def build_assembled_feature_names(
+    feature_set: str,
+    *,
+    tfidf_vocab: list[str] | None = None,
+    dcw_vocab: list[str] | None = None,
+    embedding_dim: int | None = None,
+) -> list[str]:
+    """Human-readable names in VectorAssembler order for coefficient interpretation."""
+    components = _feature_components(feature_set)
+    names: list[str] = []
+
+    if components["tfidf"]:
+        if not tfidf_vocab:
+            raise ValueError("tfidf_vocab is required for feature importance with tfidf features")
+        names.extend(f"tfidf:{term}" for term in tfidf_vocab)
+
+    if components["log_tfidf"]:
+        if not tfidf_vocab:
+            raise ValueError("tfidf_vocab is required for feature importance with log_tfidf features")
+        names.extend(f"log_tfidf:{term}" for term in tfidf_vocab)
+
+    if components["dcw"]:
+        if not dcw_vocab:
+            raise ValueError("dcw_vocab is required for feature importance with dcw features")
+        names.extend(f"dcw:{lemma}" for lemma in dcw_vocab)
+
+    if components["embeddings"]:
+        if embedding_dim is None or embedding_dim <= 0:
+            raise ValueError("embedding_dim is required for feature importance with embeddings")
+        names.extend(f"embedding:{idx}" for idx in range(embedding_dim))
+
+    if not names:
+        raise ValueError(f"No feature names resolved for feature_set={feature_set!r}")
+    return names
 
 
-def _build_binary_classifier(model_type: str, model_params: dict[str, Any]) -> Any:
+def _spark_ml_vector_to_list(vector: Vector | Any | None) -> list[float]:
+    if vector is None:
+        return []
+    if hasattr(vector, "toArray"):
+        return [float(v) for v in vector.toArray()]
+    return [float(v) for v in vector]
+
+
+def _extract_model_feature_scores(model: Any, model_type: str) -> list[float]:
     if model_type == "logistic_regression":
-        return LogisticRegression(
-            featuresCol=FEATURES_COL,
-            labelCol="binary_label",
-            family="binomial",
-            maxIter=int(model_params["maxIter"]),
-            regParam=float(model_params["regParam"]),
-            elasticNetParam=float(model_params["elasticNetParam"]),
-        )
+        return _spark_ml_vector_to_list(model.coefficients)
     if model_type == "random_forest":
-        return RandomForestClassifier(
-            featuresCol=FEATURES_COL,
-            labelCol="binary_label",
-            numTrees=int(model_params["numTrees"]),
-            maxDepth=int(model_params["maxDepth"]),
+        return _spark_ml_vector_to_list(model.featureImportances)
+    raise ValueError(f"Unsupported model_type for feature importance: {model_type!r}")
+
+
+def _per_label_fi_row(model_type: str, feature: str, raw_score: float) -> dict[str, Any]:
+    if model_type == "logistic_regression":
+        return {
+            "rank": 0,
+            "feature": feature,
+            "coefficient": raw_score,
+            "abs_coefficient": abs(raw_score),
+        }
+    return {"rank": 0, "feature": feature, "importance": raw_score}
+
+
+def _per_label_fi_sort_key(model_type: str, row: dict[str, Any]) -> tuple[float, str]:
+    if model_type == "logistic_regression":
+        return (-row["abs_coefficient"], row["feature"])
+    return (-row["importance"], row["feature"])
+
+
+def _global_fi_row(model_type: str, feature: str, mean_score: float) -> dict[str, Any]:
+    if model_type == "logistic_regression":
+        return {"rank": 0, "feature": feature, "mean_abs_coefficient": mean_score}
+    return {"rank": 0, "feature": feature, "mean_importance": mean_score}
+
+
+def _global_fi_sort_key(model_type: str, row: dict[str, Any]) -> tuple[float, str]:
+    if model_type == "logistic_regression":
+        return (-row["mean_abs_coefficient"], row["feature"])
+    return (-row["mean_importance"], row["feature"])
+
+
+def _fi_method_name(model_type: str) -> str:
+    if model_type == "logistic_regression":
+        return "abs_logistic_regression_coefficient"
+    if model_type == "random_forest":
+        return "random_forest_gini_importance"
+    raise ValueError(f"Unsupported model_type for feature importance: {model_type!r}")
+
+
+def compute_feature_importance(
+    models: dict[str, Any],
+    label_list: list[str],
+    feature_names: list[str],
+    *,
+    model_type: str,
+    top_k: int = DEFAULT_FEATURE_IMPORTANCE_TOP_K,
+) -> dict[str, Any]:
+    """Rank features per label and globally (LR: |coefficient|; RF: Gini importance)."""
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
+    per_label: dict[str, list[dict[str, Any]]] = {}
+    global_sum = [0.0] * len(feature_names)
+    labels_with_scores = 0
+    use_abs_for_global = model_type == "logistic_regression"
+
+    for label in label_list:
+        model = models.get(label)
+        if model is None:
+            continue
+        scores = _extract_model_feature_scores(model, model_type)
+        if len(scores) != len(feature_names):
+            raise ValueError(
+                f"Feature score length {len(scores)} != feature name length {len(feature_names)} "
+                f"for label={label!r}"
+            )
+        ranked = [
+            _per_label_fi_row(model_type, feature_names[idx], scores[idx])
+            for idx in range(len(feature_names))
+        ]
+        ranked.sort(key=lambda row: _per_label_fi_sort_key(model_type, row))
+        for rank, row in enumerate(ranked[:top_k], start=1):
+            row["rank"] = rank
+        per_label[label] = ranked[:top_k]
+
+        labels_with_scores += 1
+        for idx, value in enumerate(scores):
+            global_sum[idx] += abs(value) if use_abs_for_global else value
+
+    if labels_with_scores == 0:
+        if model_type == "logistic_regression":
+            raise ValueError("No logistic regression coefficients found for feature importance")
+        raise ValueError("No random forest feature importances found")
+
+    global_mean = [value / labels_with_scores for value in global_sum]
+    global_ranked = [
+        _global_fi_row(model_type, feature_names[idx], global_mean[idx])
+        for idx in range(len(feature_names))
+    ]
+    global_ranked.sort(key=lambda row: _global_fi_sort_key(model_type, row))
+    for rank, row in enumerate(global_ranked[:top_k], start=1):
+        row["rank"] = rank
+
+    return {
+        "method": _fi_method_name(model_type),
+        "top_k": top_k,
+        "num_labels": labels_with_scores,
+        "num_features": len(feature_names),
+        "global_top": global_ranked[:top_k],
+        "per_label": per_label,
+    }
+
+
+def _resolve_embedding_dim(
+    spark,
+    paths: dict[str, str],
+    *,
+    embedding_dim_source_df: DataFrame | None = None,
+) -> int:
+    if embedding_dim_source_df is not None:
+        sample = (
+            embedding_dim_source_df.select(EMBEDDING_VECTOR_COL)
+            .filter(F.col(EMBEDDING_VECTOR_COL).isNotNull())
+            .limit(1)
+            .collect()
         )
-    raise ValueError(f"Unsupported model_type={model_type!r}")
+        if not sample:
+            raise ValueError("Cannot resolve embedding dimension from training/holdout features")
+        return int(sample[0][EMBEDDING_VECTOR_COL].size)
+
+    embeddings_raw = _read_delta(spark, paths["embeddings"], "embeddings")
+    sample = (
+        embeddings_raw.transform(_ensure_embedding_vector)
+        .select(EMBEDDING_VECTOR_COL)
+        .filter(F.col(EMBEDDING_VECTOR_COL).isNotNull())
+        .limit(1)
+        .collect()
+    )
+    if not sample:
+        raise ValueError("Cannot resolve embedding dimension for feature importance")
+    return int(sample[0][EMBEDDING_VECTOR_COL].size)
+
+
+def _resolve_feature_names_for_importance(
+    spark,
+    paths: dict[str, str],
+    feature_set: str,
+    components: dict[str, bool],
+    *,
+    tfidf_vocab: list[str] | None = None,
+    dcw_vocab: list[str] | None = None,
+    embedding_dim_source_df: DataFrame | None = None,
+) -> list[str]:
+    if (components["tfidf"] or components["log_tfidf"]) and tfidf_vocab is None:
+        tfidf_vocab = load_tfidf_vocab(spark, paths)
+    if components["dcw"] and dcw_vocab is None:
+        dcw_vocab = load_dcw_vocab(spark, paths)
+
+    embedding_dim: int | None = None
+    if components["embeddings"]:
+        embedding_dim = _resolve_embedding_dim(
+            spark, paths, embedding_dim_source_df=embedding_dim_source_df
+        )
+
+    return build_assembled_feature_names(
+        feature_set,
+        tfidf_vocab=tfidf_vocab,
+        dcw_vocab=dcw_vocab,
+        embedding_dim=embedding_dim,
+    )
+
+
+def _compute_feature_importance_for_run(
+    spark,
+    model_type: str,
+    models: dict[str, Any],
+    label_list: list[str],
+    paths: dict[str, str],
+    feature_set: str,
+    components: dict[str, bool],
+    *,
+    top_k: int,
+    tfidf_vocab: list[str] | None = None,
+    dcw_vocab: list[str] | None = None,
+    embedding_dim_source_df: DataFrame | None = None,
+) -> dict[str, Any]:
+    feature_names = _resolve_feature_names_for_importance(
+        spark,
+        paths,
+        feature_set,
+        components,
+        tfidf_vocab=tfidf_vocab,
+        dcw_vocab=dcw_vocab,
+        embedding_dim_source_df=embedding_dim_source_df,
+    )
+    return compute_feature_importance(
+        models,
+        label_list,
+        feature_names,
+        model_type=model_type,
+        top_k=top_k,
+    )
+
+
+def _global_top_score(feature_importance: dict[str, Any]) -> tuple[str, float]:
+    """Return (feature_name, score) from the top global feature row."""
+    row = feature_importance["global_top"][0]
+    for key in ("mean_abs_coefficient", "mean_importance"):
+        if key in row:
+            return row["feature"], float(row[key])
+    raise ValueError("global_top row missing mean_abs_coefficient or mean_importance")
+
+
+def _iter_param_combos(
+    keys: list[str],
+    param_grid: dict[str, list[Any]],
+    defaults: dict[str, Any],
+) -> list[dict[str, Any]]:
+    value_lists = [param_grid.get(key, defaults[key]) for key in keys]
+    return [dict(zip(keys, combo, strict=True)) for combo in itertools.product(*value_lists)]
+
+
+def _default_param_grid(model_type: str) -> dict[str, list[Any]]:
+    if model_type == "logistic_regression":
+        return DEFAULT_LR_PARAM_GRID
+    if model_type == "random_forest":
+        return DEFAULT_RF_PARAM_GRID
+    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
+
+
+def _default_model_params(model_type: str) -> dict[str, Any]:
+    if model_type == "logistic_regression":
+        return dict(LR_PARAMS)
+    if model_type == "random_forest":
+        return dict(RF_PARAMS)
+    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
+
+
+def _iter_param_combos(
+    keys: list[str],
+    param_grid: dict[str, list[Any]],
+    defaults: dict[str, Any],
+) -> list[dict[str, Any]]:
+    value_lists = [param_grid.get(key, defaults[key]) for key in keys]
+    return [dict(zip(keys, combo, strict=True)) for combo in itertools.product(*value_lists)]
+
+
+def _default_param_grid(model_type: str) -> dict[str, list[Any]]:
+    if model_type == "logistic_regression":
+        return DEFAULT_LR_PARAM_GRID
+    if model_type == "random_forest":
+        return DEFAULT_RF_PARAM_GRID
+    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
+
+
+def _default_model_params(model_type: str) -> dict[str, Any]:
+    if model_type == "logistic_regression":
+        return dict(LR_PARAMS)
+    if model_type == "random_forest":
+        return dict(RF_PARAMS)
+    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
+
+
+def grid_search_hyperparameters(
+    model_type: str,
+    train_df: DataFrame,
+    val_df: DataFrame,
+    label_list: list[str],
+    threshold: float,
+    *,
+    metric: str = "micro_f1",
+    param_grid: dict[str, list[Any]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Fit one binary classifier per label on train for each grid point; pick params by val score."""
+    if metric not in GRID_SEARCH_METRIC_CHOICES:
+        raise ValueError(f"Unsupported grid-search metric: {metric!r}")
+    if model_type not in MODEL_TYPE_CHOICES:
+        raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
+
+    grid = param_grid or _default_param_grid(model_type)
+    keys = list(_default_model_params(model_type).keys())
+    combos = _iter_param_combos(keys, grid, _default_model_params(model_type))
+    model_short = "LR" if model_type == "logistic_regression" else "RF"
+    logger.info(
+        "%s grid search: %s combinations on val split (%s rows, metric=%s)",
+        model_short,
+        f"{len(combos):,}",
+        f"{val_df.count():,}",
+        metric,
+    )
+
+    best_score = float("-inf")
+    best_params = _default_model_params(model_type)
+    trial_results: list[dict[str, Any]] = []
+
+    for trial_idx, params in enumerate(combos, start=1):
+        logger.info("Grid search trial %s/%s: %s", trial_idx, len(combos), params)
+        trial_models, _ = train_multilabel_model(
+            train_df,
+            max_labels=None,
+            model_type=model_type,
+            model_params=params,
+            label_list=label_list,
+        )
+        val_predictions = predict_multilabel(
+            val_df,
+            label_list,
+            threshold,
+            models=trial_models,
+            model_type=model_type,
+        )
+        val_metrics = _compute_multilabel_metrics(val_predictions, label_list)
+        score = float(val_metrics[metric])
+        trial_results.append({**params, metric: score, "val_documents": val_metrics["documents"]})
+        logger.info("Grid search trial %s/%s %s=%.4f", trial_idx, len(combos), metric, score)
+        if score > best_score:
+            best_score = score
+            best_params = dict(params)
+
+    logger.info(
+        "Grid search best params: %s (%s=%.4f)",
+        best_params,
+        metric,
+        best_score,
+    )
+    return best_params, trial_results
 
 
 @udf(DoubleType())
@@ -843,6 +1245,8 @@ def train_multilabel_model(
     max_labels: int | None,
     model_type: str,
     model_params: dict[str, Any],
+    *,
+    label_list: list[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if model_type == "random_forest":
         logger.warning(
@@ -850,7 +1254,7 @@ def train_multilabel_model(
         )
     logger.info("%s hyperparameters: %s", model_type, model_params)
 
-    label_list = _collect_training_labels(train_df, max_labels)
+    label_list = label_list or _collect_training_labels(train_df, max_labels)
     models: dict[str, Any] = {}
 
     for label in label_list:
@@ -1093,6 +1497,144 @@ def evaluate_multilabel(
     return metrics
 
 
+def parse_threshold_sweep_values(raw: str | None) -> tuple[float, ...]:
+    if not raw:
+        return DEFAULT_THRESHOLD_SWEEP
+    values: list[float] = []
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if cleaned:
+            values.append(float(cleaned))
+    if not values:
+        raise ValueError("No thresholds parsed from --threshold-sweep")
+    return tuple(values)
+
+
+def compute_threshold_sweep(
+    predictions: DataFrame,
+    label_list: list[str],
+    thresholds: tuple[float, ...] | list[float],
+    *,
+    prob_column_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Evaluate holdout metrics at multiple probability thresholds using saved prob_* columns."""
+    prob_cols = prob_columns_in_df(predictions)
+    if not prob_cols:
+        raise ValueError(
+            "Prediction Delta has no prob_* columns. Re-run --predict-stage predict after rebuilding."
+        )
+
+    prob_map = prob_column_map or {
+        label: col
+        for label, col in label_prob_column_map(label_list).items()
+        if col in prob_cols
+    }
+    if not prob_map:
+        raise ValueError("Could not map any labels to prob_* columns on the prediction Delta")
+
+    rows: list[dict[str, Any]] = []
+    for threshold in thresholds:
+        scored = apply_multilabel_threshold(
+            predictions,
+            label_list,
+            float(threshold),
+            prob_column_map=prob_map,
+        )
+        metrics = evaluate_multilabel(scored, label_list)
+        for split, values in metrics.items():
+            if isinstance(values, dict):
+                rows.append({"threshold": float(threshold), "split": split, **values})
+
+    return {
+        "thresholds": [float(t) for t in thresholds],
+        "num_probability_columns": len(prob_cols),
+        "rows": rows,
+    }
+
+
+def save_threshold_sweep_outputs(
+    spark,
+    exp_id: str,
+    batch_date: str | None,
+    sweep: dict[str, Any],
+    *,
+    prediction_delta_path: str,
+    prediction_ts: str | None = None,
+) -> str:
+    pkl_path = model_bank_threshold_sweep_path(exp_id, batch_date)
+    json_path = pkl_path.replace(".pkl", ".json")
+    payload = {
+        "exp_id": exp_id,
+        "prediction_delta_path": prediction_delta_path,
+        "prediction_ts": prediction_ts,
+        "thresholds": sweep["thresholds"],
+        "num_probability_columns": sweep["num_probability_columns"],
+        "rows": sweep["rows"],
+    }
+    save_pickle(pkl_path, payload, spark)
+    save_json(json_path, payload, spark)
+    logger.info("Saved threshold sweep to %s", pkl_path)
+    logger.info("Saved threshold sweep JSON to %s", json_path)
+    return pkl_path
+
+
+def _hadoop_path_exists(spark, path: str) -> bool:
+    sc = spark.sparkContext
+    URI = sc._jvm.java.net.URI
+    Path = sc._jvm.org.apache.hadoop.fs.Path
+    FileSystem = sc._jvm.org.apache.hadoop.fs.FileSystem
+    fs = FileSystem.get(URI(path), sc._jsc.hadoopConfiguration())
+    return fs.exists(Path(path))
+
+
+def _feature_importance_json_exists(spark, exp_id: str) -> str | None:
+    for subdir_key in ("feature_importance_dir", "model_dir"):
+        base = model_bank_experiment_subdir(exp_id, subdir_key)
+        matches = [
+            name
+            for name in _list_hadoop_child_names(spark, base)
+            if name.startswith("feature_importance_") and name.endswith(".json")
+        ]
+        if matches:
+            return f"{base}/{sorted(matches)[-1]}"
+    return None
+
+
+def _load_checkpointed_predictions(
+    spark,
+    args: argparse.Namespace,
+    label_list: list[str],
+) -> tuple[DataFrame, str, str]:
+    pred_delta_path = resolve_prediction_delta_path(
+        spark,
+        args.prediction_date,
+        resolve_prediction_exp_id(args),
+        prediction_suffix=args.prediction_suffix,
+    )
+    logger.info("Loading predictions from %s", pred_delta_path)
+    predictions = spark.read.format("delta").load(pred_delta_path)
+    required = {DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, PREDICTED_LABELS_COL}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"Prediction Delta at {pred_delta_path} missing columns {missing}")
+
+    if args.holdout_splits:
+        predictions = predictions.filter(F.col(SPLIT_COL).isin(args.holdout_splits))
+        logger.info("Filtered predictions to splits: %s", args.holdout_splits)
+
+    if args.limit:
+        predictions = predictions.limit(args.limit)
+        logger.info("Smoke test: limited predictions to %s rows", f"{args.limit:,}")
+
+    prediction_ts_rows = predictions.select("prediction_ts").distinct().limit(2).collect()
+    if len(prediction_ts_rows) != 1:
+        raise ValueError(
+            f"Expected one prediction_ts in {pred_delta_path}, found {len(prediction_ts_rows)}"
+        )
+    prediction_ts = prediction_ts_rows[0].prediction_ts
+    return predictions, pred_delta_path, prediction_ts
+
+
 def _split_row_counts(holdout_df: DataFrame | None) -> dict[str, int]:
     if holdout_df is None:
         return {"holdout": 0, "val": 0, "test": 0, "oot": 0}
@@ -1190,150 +1732,6 @@ def print_dry_run_summary(
     ).show(10, truncate=False)
 
 
-def save_outputs(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-    components: dict[str, bool],
-    train_df: DataFrame,
-    holdout_df: DataFrame | None,
-    models: dict[str, Any],
-    label_list: list[str],
-    metrics: dict[str, dict[str, float]] | None,
-    predictions: DataFrame | None,
-    hyperparameters: dict[str, Any],
-) -> dict[str, str]:
-    train_date = datetime.now(timezone.utc).strftime("%Y%m%d")
-    model_name = args.model_type
-    per_label_dir = model_bank_per_label_models_dir(run_id)
-    model_manifest_path = model_bank_model_manifest_path(run_id, model_name, train_date)
-    pred_pkl_path = prediction_manifest_path(train_date, args.prediction_suffix)
-    pred_delta_path = prediction_delta_path(train_date, args.prediction_suffix)
-
-    model_paths: dict[str, str] = {}
-    for label, model in models.items():
-        safe = _safe_label_name(label)
-        model_path = f"{per_label_dir}/{safe}"
-        model.write().overwrite().save(model_path)
-        model_paths[label] = model_path
-
-    assembled_cols = [DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, FEATURES_COL]
-    write_delta(train_df.select(*assembled_cols), paths["X_train"])
-    logger.info("Saved X_train to %s", paths["X_train"])
-    if holdout_df is not None and not args.train_only:
-        write_delta(holdout_df.select(*assembled_cols), paths["X_val_test_oot"])
-        logger.info("Saved X_val_test_oot to %s", paths["X_val_test_oot"])
-    else:
-        logger.info("Skipped X_val_test_oot (train-only mode)")
-
-    holdout_counts = _split_row_counts(holdout_df)
-    n_train = train_df.count()
-    prediction_ts = datetime.now(timezone.utc).isoformat()
-    metrics = metrics or {}
-
-    metadata = {
-        "run_id": run_id,
-        "feature_run_id": feature_run_id,
-        "timestamp": prediction_ts,
-        "model_type": args.model_type,
-        "feature_set": args.feature_set,
-        "uses_tfidf": components["tfidf"],
-        "uses_log_tfidf": components["log_tfidf"],
-        "uses_dcw": components["dcw"],
-        "uses_embeddings": components["embeddings"],
-        "train_only": args.train_only,
-        "multilabel_strategy": MULTILABEL_STRATEGY,
-        "multilabel_threshold": args.multilabel_threshold,
-        "max_labels": args.max_labels,
-        "label_normalization": LABEL_NORMALIZATION,
-        "input_feature_paths": {
-            "tfidf_train": paths["tfidf_train"],
-            "tfidf_val_test_oot": paths["tfidf_val_test_oot"],
-            "dcw_train": paths["dcw_train"],
-            "dcw_val_test_oot": paths["dcw_val_test_oot"],
-            "embeddings": paths["embeddings"],
-            "tfidf_pkl": paths["tfidf_pkl"],
-            "dcw_pkl": paths["dcw_pkl"],
-        },
-        "labels_path": paths["labels"],
-        "assembled_dataset_paths": {
-            "X_train": paths["X_train"],
-            "X_val_test_oot": paths["X_val_test_oot"],
-            "X_unlabelled": paths["X_unlabelled"],
-        },
-        "per_label_model_paths": model_paths,
-        "probability_columns": label_prob_column_map(label_list),
-        "hyperparameters": hyperparameters,
-        "metrics": metrics,
-        "row_counts": {
-            "train_documents": n_train,
-            "holdout_documents": holdout_counts["holdout"],
-            "val_documents": holdout_counts["val"],
-            "test_documents": holdout_counts["test"],
-            "oot_documents": holdout_counts["oot"],
-        },
-        "num_unique_labels": len(label_list),
-        "split_column": SPLIT_COL,
-        "notes": (
-            "TF-IDF, DCW, and embeddings were precomputed in upstream Gold jobs "
-            "and were not refit in this training script. "
-            "Multi-label training uses binary relevance (one binary classifier per label). "
-            "Spark ML models live under model/per_label/; this .pkl holds metadata and metrics."
-            + (" Holdout scoring deferred (--train-only)." if args.train_only else "")
-        ),
-    }
-    save_pickle(model_manifest_path, metadata, spark)
-    model_manifest_json = model_manifest_path.replace(".pkl", ".json")
-    save_json(model_manifest_json, metadata, spark)
-    logger.info("Saved model manifest JSON to %s", model_manifest_json)
-
-    if (
-        not args.train_only
-        and predictions is not None
-        and predictions.limit(1).count() > 0
-    ):
-        pred_out = format_prediction_delta_df(
-            predictions,
-            run_id,
-            feature_run_id,
-            prediction_ts,
-            multilabel_threshold=args.multilabel_threshold,
-        )
-        write_delta(pred_out, pred_delta_path)
-        save_pickle(
-            pred_pkl_path,
-            {
-                "run_id": run_id,
-                "feature_run_id": feature_run_id,
-                "prediction_ts": prediction_ts,
-                "prediction_delta_path": pred_delta_path,
-                "row_count": holdout_counts["holdout"],
-                "metrics": metrics,
-            },
-            spark,
-        )
-    elif args.train_only:
-        logger.info("Train-only mode: skipped holdout predictions for run_id=%s", run_id)
-    else:
-        logger.warning("No holdout predictions to write for run_id=%s", run_id)
-
-    logger.info("Saved per-label Spark models under %s", per_label_dir)
-    logger.info("Saved model manifest to %s", model_manifest_path)
-    if not args.train_only:
-        logger.info("Saved prediction manifest to %s", pred_pkl_path)
-
-    out = {
-        "per_label_models_dir": per_label_dir,
-        "model_manifest_path": model_manifest_path,
-    }
-    if not args.train_only:
-        out["prediction_manifest_path"] = pred_pkl_path
-        out["prediction_delta_path"] = pred_delta_path
-    return out
-
-
 def save_holdout_features(holdout_df: DataFrame, paths: dict[str, str]) -> None:
     """Persist assembled holdout X before scoring (survives predict/metrics OOM)."""
     assembled_cols = [DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, FEATURES_COL]
@@ -1392,12 +1790,9 @@ def save_evaluation_outputs(
         save_holdout_features(holdout_df, paths)
 
     holdout_counts = _split_row_counts(predictions)
-    batch_name = _prediction_batch_name_from_delta_path(pred_delta_path)
-    pred_pkl_path = (
-        prediction_manifest_path_for_batch(batch_name)
-        if batch_name
-        else prediction_manifest_path(_prediction_batch_date_from_delta_path(pred_delta_path))
-    )
+    pred_exp_id = _prediction_exp_id_from_delta_path(pred_delta_path) or run_id
+    batch_date = _prediction_batch_date_from_delta_path(pred_delta_path)
+    pred_pkl_path = model_bank_prediction_metrics_manifest_path(pred_exp_id, batch_date)
     pred_json_path = pred_pkl_path.replace(".pkl", ".json")
 
     if not skip_pred_delta_write:
@@ -1447,703 +1842,7 @@ def save_evaluation_outputs(
     }
 
 
-def _load_predict_context(
-    spark,
-    run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> tuple[dict[str, Any], str, dict[str, str], str, dict[str, bool], float, list[str], str]:
-    manifest, manifest_path = load_training_manifest(
-        spark,
-        run_id,
-        args.model_date,
-        paths=paths,
-        feature_set=args.feature_set,
-        model_type=args.model_type,
-    )
-    per_label_paths = manifest.get("per_label_model_paths")
-    if not per_label_paths:
-        raise ValueError(f"Training manifest at {manifest_path} missing per_label_model_paths")
-
-    feature_set = manifest.get("feature_set", args.feature_set)
-    if feature_set != args.feature_set:
-        logger.warning(
-            "Using feature_set=%r from manifest (CLI had %r)",
-            feature_set,
-            args.feature_set,
-        )
-    components = _feature_components(feature_set)
-    threshold = args.multilabel_threshold
-    if manifest.get("multilabel_threshold") is not None and threshold == 0.5:
-        threshold = float(manifest["multilabel_threshold"])
-
-    label_list = list(per_label_paths.keys())
-    model_type = resolve_model_type_for_run(spark, run_id, per_label_paths, args.model_type)
-    manifest_model_type = manifest.get("model_type")
-    if manifest_model_type and manifest_model_type != model_type:
-        logger.warning(
-            "Manifest model_type=%r differs from resolved %r; using resolved type for scoring",
-            manifest_model_type,
-            model_type,
-        )
-    return (
-        manifest,
-        manifest_path,
-        per_label_paths,
-        feature_set,
-        components,
-        threshold,
-        label_list,
-        model_type,
-    )
 
 
-def _build_holdout_from_features(
-    spark,
-    paths: dict[str, str],
-    feature_set: str,
-    components: dict[str, bool],
-    *,
-    holdout_splits: list[str] | None,
-    limit: int | None,
-) -> DataFrame:
-    dcw_vocab = load_dcw_vocab(spark, paths) if components["dcw"] else None
-    _, holdout_features, labels, embeddings_df = load_features(
-        spark, paths, feature_set, include_holdout=True
-    )
-    holdout_df = prepare_holdout_data(holdout_features, labels, embeddings_df)
-
-    if holdout_splits:
-        holdout_df = holdout_df.filter(F.col(SPLIT_COL).isin(holdout_splits))
-        logger.info("Filtered holdout to splits: %s", holdout_splits)
-
-    if limit:
-        holdout_df = holdout_df.limit(limit)
-        logger.info("Smoke test: limited holdout to %s rows", f"{limit:,}")
-
-    return build_feature_column(holdout_df, feature_set, dcw_vocab=dcw_vocab)
-
-
-def _load_saved_holdout_x(
-    spark,
-    paths: dict[str, str],
-    *,
-    holdout_splits: list[str] | None,
-    limit: int | None,
-) -> DataFrame:
-    x_path = paths["X_val_test_oot"]
-    logger.info("Loading saved holdout X from %s", x_path)
-    holdout_df = _read_delta(spark, x_path, "X_val_test_oot")
-    required = {DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, FEATURES_COL}
-    missing = required - set(holdout_df.columns)
-    if missing:
-        raise ValueError(
-            f"X_val_test_oot at {x_path} missing columns {missing}. "
-            "Run --predict-stage features first."
-        )
-
-    if holdout_splits:
-        holdout_df = holdout_df.filter(F.col(SPLIT_COL).isin(holdout_splits))
-        logger.info("Filtered saved holdout X to splits: %s", holdout_splits)
-
-    if limit:
-        holdout_df = holdout_df.limit(limit)
-        logger.info("Smoke test: limited saved holdout X to %s rows", f"{limit:,}")
-
-    return holdout_df
-
-
-def run_predict_stage_features(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    components = _feature_components(args.feature_set)
-    logger.info(
-        "Predict stage=features: assembling holdout X (feature_set=%s)",
-        args.feature_set,
-    )
-    holdout_df = _build_holdout_from_features(
-        spark,
-        paths,
-        args.feature_set,
-        components,
-        holdout_splits=args.holdout_splits,
-        limit=args.limit,
-    )
-
-    if args.dry_run:
-        n_rows = holdout_df.count()
-        logger.info("DRY RUN: would save %s holdout rows to %s", f"{n_rows:,}", paths["X_val_test_oot"])
-        return
-
-    save_holdout_features(holdout_df, paths)
-    logger.info("Predict stage=features complete: %s", paths["X_val_test_oot"])
-
-
-def run_predict_stage_predict(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, manifest_path, per_label_paths, feature_set, components, threshold, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
-    logger.info(
-        "Predict stage=predict: scoring %s labels from saved holdout X",
-        f"{len(label_list):,}",
-    )
-    holdout_df = _load_saved_holdout_x(
-        spark,
-        paths,
-        holdout_splits=args.holdout_splits,
-        limit=args.limit,
-    )
-
-    predictions = predict_multilabel(
-        holdout_df,
-        label_list,
-        threshold,
-        per_label_paths=per_label_paths,
-        model_type=model_type,
-    )
-
-    if args.dry_run:
-        metrics = evaluate_multilabel(predictions, label_list)
-        print_dry_run_summary(
-            run_id,
-            args,
-            components,
-            None,
-            holdout_df,
-            label_list,
-            metrics,
-            predictions,
-            manifest.get("hyperparameters", _default_hyperparameters(model_type)),
-        )
-        return
-
-    pred_delta_path = prediction_delta_path(args.prediction_date, args.prediction_suffix)
-    predictions, prediction_ts, pred_delta_path = checkpoint_predictions(
-        spark,
-        predictions,
-        run_id,
-        feature_run_id,
-        pred_delta_path=pred_delta_path,
-        multilabel_threshold=threshold,
-    )
-    logger.info(
-        "Predict stage=predict complete: %s rows checkpointed to %s (ts=%s)",
-        f"{predictions.count():,}",
-        pred_delta_path,
-        prediction_ts,
-    )
-
-
-def run_predict_stage_metrics(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, manifest_path, _, feature_set, components, threshold, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
-    pred_delta_path = resolve_prediction_delta_path(
-        spark, args.prediction_date, args.prediction_suffix
-    )
-    logger.info("Predict stage=metrics: loading predictions from %s", pred_delta_path)
-    predictions = spark.read.format("delta").load(pred_delta_path)
-    required = {DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, PREDICTED_LABELS_COL}
-    missing = required - set(predictions.columns)
-    if missing:
-        raise ValueError(f"Prediction Delta at {pred_delta_path} missing columns {missing}")
-
-    if args.holdout_splits:
-        predictions = predictions.filter(F.col(SPLIT_COL).isin(args.holdout_splits))
-        logger.info("Filtered predictions to splits: %s", args.holdout_splits)
-
-    if args.limit:
-        predictions = predictions.limit(args.limit)
-        logger.info("Smoke test: limited predictions to %s rows", f"{args.limit:,}")
-
-    if args.dry_run:
-        metrics = evaluate_multilabel(predictions, label_list)
-        print_dry_run_summary(
-            run_id,
-            args,
-            components,
-            None,
-            None,
-            label_list,
-            metrics,
-            predictions,
-            manifest.get("hyperparameters", _default_hyperparameters(model_type)),
-        )
-        return
-
-    prediction_ts_rows = predictions.select("prediction_ts").distinct().limit(2).collect()
-    if len(prediction_ts_rows) != 1:
-        raise ValueError(
-            f"Expected one prediction_ts in {pred_delta_path}, found {len(prediction_ts_rows)}"
-        )
-    prediction_ts = prediction_ts_rows[0].prediction_ts
-
-    logger.info("Computing metrics on checkpointed predictions")
-    metrics = evaluate_multilabel(predictions, label_list)
-
-    save_evaluation_outputs(
-        spark,
-        run_id,
-        feature_run_id,
-        paths,
-        manifest_path,
-        label_list,
-        metrics,
-        predictions,
-        threshold,
-        prediction_ts,
-        pred_delta_path,
-        skip_x_write=True,
-        skip_pred_delta_write=True,
-    )
-    logger.info("Predict stage=metrics complete")
-
-
-def run_predict_all(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, manifest_path, per_label_paths, feature_set, components, threshold, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
-    logger.info("Scoring %s labels on val/test/oot", f"{len(label_list):,}")
-
-    holdout_df = _build_holdout_from_features(
-        spark,
-        paths,
-        feature_set,
-        components,
-        holdout_splits=args.holdout_splits,
-        limit=args.limit,
-    )
-
-    if not args.dry_run:
-        save_holdout_features(holdout_df, paths)
-
-    predictions = predict_multilabel(
-        holdout_df,
-        label_list,
-        threshold,
-        per_label_paths=per_label_paths,
-        model_type=model_type,
-    )
-
-    if args.dry_run:
-        metrics = evaluate_multilabel(predictions, label_list)
-        print_dry_run_summary(
-            run_id,
-            args,
-            components,
-            None,
-            holdout_df,
-            label_list,
-            metrics,
-            predictions,
-            manifest.get("hyperparameters", _default_hyperparameters(model_type)),
-        )
-        return
-
-    pred_delta_path = prediction_delta_path(args.prediction_date, args.prediction_suffix)
-    predictions, prediction_ts, pred_delta_path = checkpoint_predictions(
-        spark,
-        predictions,
-        run_id,
-        feature_run_id,
-        pred_delta_path=pred_delta_path,
-        multilabel_threshold=threshold,
-    )
-    logger.info("Computing metrics on checkpointed predictions (slim Delta reload)")
-    metrics = evaluate_multilabel(predictions, label_list)
-
-    save_evaluation_outputs(
-        spark,
-        run_id,
-        feature_run_id,
-        paths,
-        manifest_path,
-        label_list,
-        metrics,
-        predictions,
-        threshold,
-        prediction_ts,
-        pred_delta_path,
-        skip_x_write=True,
-        skip_pred_delta_write=True,
-    )
-
-
-def run_recover_manifest(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    """Write model manifest from existing per_label models (skip retraining)."""
-    components = _feature_components(args.feature_set)
-    model_params = resolve_model_params(args)
-    reconstructed = _reconstruct_manifest_from_per_label_models(
-        spark, run_id, paths, args.feature_set, model_type=args.model_type
-    )
-    label_list = list(reconstructed["per_label_model_paths"].keys())
-    model_paths = reconstructed["per_label_model_paths"]
-    try:
-        n_train = spark.read.format("delta").load(paths["X_train"]).count()
-    except Exception as exc:
-        logger.warning("Could not count X_train (%s); using 0", exc)
-        n_train = 0
-
-    train_date = datetime.now(timezone.utc).strftime("%Y%m%d")
-    model_manifest_path = model_bank_model_manifest_path(run_id, args.model_type, train_date)
-    prediction_ts = datetime.now(timezone.utc).isoformat()
-    hyperparameters = {
-        **model_params,
-        "model_type": args.model_type,
-        "multilabel_threshold": args.multilabel_threshold,
-        "max_labels": args.max_labels,
-        "train_only": True,
-        "recovered_manifest": True,
-    }
-    metadata = {
-        "run_id": run_id,
-        "feature_run_id": feature_run_id,
-        "timestamp": prediction_ts,
-        "model_type": args.model_type,
-        "feature_set": args.feature_set,
-        "uses_tfidf": components["tfidf"],
-        "uses_log_tfidf": components["log_tfidf"],
-        "uses_dcw": components["dcw"],
-        "uses_embeddings": components["embeddings"],
-        "train_only": True,
-        "multilabel_strategy": MULTILABEL_STRATEGY,
-        "multilabel_threshold": args.multilabel_threshold,
-        "max_labels": args.max_labels,
-        "label_normalization": LABEL_NORMALIZATION,
-        "input_feature_paths": {
-            "tfidf_train": paths["tfidf_train"],
-            "tfidf_val_test_oot": paths["tfidf_val_test_oot"],
-            "dcw_train": paths["dcw_train"],
-            "dcw_val_test_oot": paths["dcw_val_test_oot"],
-            "embeddings": paths["embeddings"],
-            "tfidf_pkl": paths["tfidf_pkl"],
-            "dcw_pkl": paths["dcw_pkl"],
-        },
-        "labels_path": paths["labels"],
-        "assembled_dataset_paths": {
-            "X_train": paths["X_train"],
-            "X_val_test_oot": paths["X_val_test_oot"],
-            "X_unlabelled": paths["X_unlabelled"],
-        },
-        "per_label_model_paths": model_paths,
-        "probability_columns": label_prob_column_map(label_list),
-        "hyperparameters": hyperparameters,
-        "metrics": {},
-        "row_counts": {
-            "train_documents": n_train,
-            "holdout_documents": 0,
-            "val_documents": 0,
-            "test_documents": 0,
-            "oot_documents": 0,
-        },
-        "num_unique_labels": len(label_list),
-        "split_column": SPLIT_COL,
-        "notes": "Manifest recovered from per_label models without retraining.",
-        "recovered_from_per_label": True,
-    }
-    save_pickle(model_manifest_path, metadata, spark)
-    model_manifest_json = model_manifest_path.replace(".pkl", ".json")
-    save_json(model_manifest_json, metadata, spark)
-    logger.info("Recovered model manifest to %s", model_manifest_path)
-    logger.info("Recovered model manifest JSON to %s", model_manifest_json)
-
-
-def run_predict_only(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    stage = args.predict_stage
-    if stage == "features":
-        run_predict_stage_features(spark, run_id, feature_run_id, paths, args)
-    elif stage == "predict":
-        run_predict_stage_predict(spark, run_id, feature_run_id, paths, args)
-    elif stage == "metrics":
-        run_predict_stage_metrics(spark, run_id, feature_run_id, paths, args)
-    else:
-        run_predict_all(spark, run_id, feature_run_id, paths, args)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Train a multi-label Spark ML classifier on precomputed Gold features"
-    )
-    parser.add_argument("--run-id", default=None, help="Training run id (model_bank path). Default: UTC timestamp")
-    parser.add_argument(
-        "--feature-run-id",
-        default=None,
-        help="Gold feature run to read TF-IDF/DCW from (e.g. run001). Default: same as --run-id",
-    )
-    parser.add_argument(
-        "--x-run-id",
-        default=None,
-        help="Gold run for assembled X_train / X_val_test_oot (default: same as --feature-run-id).",
-    )
-    parser.add_argument(
-        "--feature-set",
-        choices=FEATURE_SET_CHOICES,
-        default="tfidf_dcw_embeddings",
-        help=(
-            "Feature columns to use (default: tfidf_dcw_embeddings = tfidf + dcw + embeddings; "
-            "all = log_tfidf + dcw + embeddings)"
-        ),
-    )
-    parser.add_argument(
-        "--train-only",
-        action="store_true",
-        help="Train on train split only; save models and X_train. Skip holdout scoring and predictions.",
-    )
-    parser.add_argument(
-        "--recover-manifest",
-        action="store_true",
-        help="Write model manifest JSON/pkl from existing per_label models (no retraining).",
-    )
-    parser.add_argument(
-        "--predict-only",
-        action="store_true",
-        help="Load saved per-label models; run holdout pipeline (see --predict-stage).",
-    )
-    parser.add_argument(
-        "--predict-stage",
-        choices=PREDICT_STAGES,
-        default="all",
-        help=(
-            "With --predict-only: features=save X_val_test_oot; predict=score and checkpoint Delta; "
-            "metrics=metrics from checkpoint; all=full pipeline (default)"
-        ),
-    )
-    parser.add_argument(
-        "--prediction-date",
-        default=None,
-        help="Prediction batch YYYYMMDD for predict/metrics stages (default: today or latest Delta).",
-    )
-    parser.add_argument(
-        "--prediction-suffix",
-        default=None,
-        help="Optional tag appended to prediction batch name, e.g. LR → prediction_20260613_LR",
-    )
-    parser.add_argument(
-        "--model-date",
-        default=None,
-        help="Model manifest date YYYYMMDD for --predict-only (default: latest {model_type}_*.pkl).",
-    )
-    parser.add_argument(
-        "--holdout-splits",
-        nargs="+",
-        choices=HOLDOUT_SPLITS,
-        default=None,
-        help="Score only these holdout splits (default: val, test, and oot). Example: --holdout-splits val test",
-    )
-    parser.add_argument(
-        "--model-type",
-        choices=MODEL_TYPE_CHOICES,
-        default=DEFAULT_MODEL_TYPE,
-        help="Binary relevance classifier per label (default: random_forest)",
-    )
-    parser.add_argument(
-        "--max-iter",
-        type=int,
-        default=None,
-        help=f"Logistic Regression maxIter (default: {LR_PARAMS['maxIter']})",
-    )
-    parser.add_argument(
-        "--reg-param",
-        type=float,
-        default=None,
-        help=f"Logistic Regression L2 regParam (default: {LR_PARAMS['regParam']})",
-    )
-    parser.add_argument(
-        "--elastic-net-param",
-        type=float,
-        default=None,
-        help=f"Logistic Regression elasticNetParam (default: {LR_PARAMS['elasticNetParam']})",
-    )
-    parser.add_argument(
-        "--num-trees",
-        type=int,
-        default=None,
-        help=f"Random Forest numTrees (default: {RF_PARAMS['numTrees']})",
-    )
-    parser.add_argument(
-        "--max-depth",
-        type=int,
-        default=None,
-        help=f"Random Forest maxDepth (default: {RF_PARAMS['maxDepth']})",
-    )
-    parser.add_argument(
-        "--multilabel-threshold",
-        type=float,
-        default=0.5,
-        help="Probability threshold for binary relevance predictions (default: 0.5)",
-    )
-    parser.add_argument(
-        "--max-labels",
-        type=int,
-        default=None,
-        help="Cap the number of labels trained (top by train frequency)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run training/evaluation locally without writing models, predictions, metrics, or metadata.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit rows after joins for smoke testing (may reduce join counts)",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-    )
-    args = parser.parse_args()
-    if args.train_only and args.predict_only:
-        parser.error("--train-only and --predict-only are mutually exclusive")
-    if args.recover_manifest and (args.train_only or args.predict_only):
-        parser.error("--recover-manifest cannot be combined with --train-only or --predict-only")
-    if args.predict_stage != "all" and not args.predict_only:
-        parser.error("--predict-stage requires --predict-only")
-
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    run_id = args.run_id or default_run_id()
-    feature_run_id = args.feature_run_id or run_id
-    x_run_id = args.x_run_id or feature_run_id
-    paths = load_schema_paths(feature_run_id, x_run_id=x_run_id)
-    components = _feature_components(args.feature_set)
-    model_params = resolve_model_params(args)
-
-    logger.info("Training run ID: %s | Feature run ID: %s | X run ID: %s", run_id, feature_run_id, x_run_id)
-    logger.info("Model: %s | Feature set: %s", args.model_type, args.feature_set)
-    if args.train_only:
-        logger.info("Train-only mode: holdout load, scoring, and predictions will be skipped")
-    if args.predict_only:
-        logger.info("Predict-only mode: stage=%s", args.predict_stage)
-    if args.dry_run:
-        logger.info("DRY RUN enabled: skipping all writes to R2/S3A/model_bank.")
-
-    spark = create_spark_session("gold-model-training")
-
-    if args.recover_manifest:
-        run_recover_manifest(spark, run_id, feature_run_id, paths, args)
-        logger.info("Manifest recovery complete for run_id=%s", run_id)
-        return
-
-    if args.predict_only:
-        run_predict_only(spark, run_id, feature_run_id, paths, args)
-        logger.info("Holdout pipeline complete for run_id=%s (stage=%s)", run_id, args.predict_stage)
-        return
-
-    include_holdout = not args.train_only
-    dcw_vocab = load_dcw_vocab(spark, paths) if components["dcw"] else None
-    train_features, holdout_features, labels, embeddings_df = load_features(
-        spark, paths, args.feature_set, include_holdout=include_holdout
-    )
-    train_df, holdout_df = prepare_training_data(
-        train_features, holdout_features, labels, embeddings_df
-    )
-
-    if args.limit:
-        train_df = train_df.limit(args.limit)
-        if holdout_df is not None:
-            holdout_df = holdout_df.limit(args.limit)
-        logger.info("Smoke test: limited to %s rows per split after joins", f"{args.limit:,}")
-
-    train_df = build_feature_column(train_df, args.feature_set, dcw_vocab=dcw_vocab)
-    if holdout_df is not None:
-        holdout_df = build_feature_column(holdout_df, args.feature_set, dcw_vocab=dcw_vocab)
-
-    models, label_list = train_multilabel_model(
-        train_df, args.max_labels, args.model_type, model_params
-    )
-
-    predictions: DataFrame | None = None
-    metrics: dict[str, dict[str, float]] | None = None
-    if not args.train_only:
-        assert holdout_df is not None
-        predictions = predict_multilabel(
-            holdout_df,
-            label_list,
-            args.multilabel_threshold,
-            models=models,
-            model_type=args.model_type,
-        )
-        metrics = evaluate_multilabel(predictions, label_list)
-
-    if args.dry_run:
-        print_dry_run_summary(
-            run_id,
-            args,
-            components,
-            train_df,
-            holdout_df,
-            label_list,
-            metrics,
-            predictions,
-            model_params,
-        )
-    else:
-        hyperparameters = {
-            **model_params,
-            "model_type": args.model_type,
-            "multilabel_threshold": args.multilabel_threshold,
-            "max_labels": args.max_labels,
-            "train_only": args.train_only,
-        }
-        save_outputs(
-            spark,
-            run_id,
-            feature_run_id,
-            paths,
-            args,
-            components,
-            train_df,
-            holdout_df,
-            models,
-            label_list,
-            metrics,
-            predictions,
-            hyperparameters,
-        )
-
-    logger.info("Model training complete for run_id=%s", run_id)
-
-
-if __name__ == "__main__":
-    main()
+def create_pipeline_spark_session(app_name: str):
+    return create_spark_session(app_name)

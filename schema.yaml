@@ -57,6 +57,7 @@ gold:
       partition_col: snapshot_date
     embeddings_wiki:
       path: embeddings_wiki
+      partition_col: snapshot_date
     label_store:
       path: label_store
       partition_col: snapshot_date
@@ -77,6 +78,7 @@ gold:
   runs:
     base: runs
     default_run_id: run001
+    default_gold_run_id: run001
     tfidf_train: tfidf_train
     tfidf_val_test_oot: tfidf_val_test_oot
     tfidf_svd_train: tfidf_svd_train
@@ -88,15 +90,24 @@ gold:
     X_unlabelled: X_unlabelled
   model_predictions:
     base: model_predictions
-    file_prefix: prediction_
+    date_partition_prefix: prediction_date=
+    default_exp_id: null
 
 model_bank:
   path: "s3a://cs611-project/model_bank"
-  runs:
-    base: runs
-    feature_extractors: feature_extractors
+  features:
+    base: features
     tfidf_pkl: tfidf.pkl
     tfidf_svd_pkl: tfidf_svd.pkl
     dcw_pkl: dcw.pkl
+    tfidf_json_dir: tfidf
+    dcw_score: dcw_score
+    dcw_train_doc_ids: dcw_train_doc_ids
+  experiments:
+    base: experiments
     model_dir: model
+    manifest_dir: manifest
+    metrics_dir: metrics
+    feature_importance_dir: feature_importance
+    per_label_subdir: per_label
     default_model_name: random_forest
