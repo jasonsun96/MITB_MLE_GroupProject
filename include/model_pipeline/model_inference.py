@@ -17,6 +17,7 @@ from model_pipeline.multilabel_core import (
     _compute_feature_importance_for_run,
     _default_hyperparameters,
     _feature_components,
+    _feature_importance_json_exists,
     _hadoop_path_exists,
     _load_checkpointed_predictions,
     checkpoint_predictions,
