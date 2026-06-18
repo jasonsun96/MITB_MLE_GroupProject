@@ -80,6 +80,9 @@ gold:
     runs:
       path: runs
 
+monitoring:
+  path: "s3a://cs611-project/monitoring"
+
 model_bank:
   path: "s3a://cs611-project/model_bank"
   runs:
