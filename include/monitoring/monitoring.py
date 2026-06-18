@@ -1,3 +1,70 @@
+'''
+Batch-inference monitoring for the Legal Topic Tagger.
+
+================================================================================
+ASSUMPTIONS & THINGS THAT PROBABLY NEED CHANGING
+================================================================================
+This script stitches together tables/artifacts produced by other parts of the
+pipeline. Where those aren't built yet, I made assumptions — listed here with the
+function/constant to edit. Please sanity-check these against your work:
+
+UPSTREAM DATA CONTRACTS (the script reads these; some don't exist yet):
+  • inference_features (gold) MUST carry a `dcw_features` map<string,double>
+    keyed by DCW *lemma* (e.g. "fighting"), next to document_id + the model
+    `features` vector. CSI's production side reads it. This table is currently
+    EMPTY on R2 and the assembly job isn't written — whoever builds it must add
+    that column.                                   → load_csi_production_values()
+  • published_predictions (gold) MUST be written by batch inference with columns
+    batch_id, document_id, predicted_labels (array<string>), deployment_group.
+    Performance / PSI / CSI all read it. Currently empty.
+  • Ground truth: the lawyer-reviewed 10% must be appended to label_store with
+    category='production'. Ingesting those reviewed labels is NOT done here.
+                                                   → REVIEWED_CATEGORY, load_ground_truth()
+
+MODEL RESOLUTION (hardcoded, but need to be wired to correct path once done):
+  • T0_EXP_ID = "exp004_LR_tfidf_dcw_gs" is the assumed PRODUCTION model. Replace
+    with a lookup of the 'production' alias (include/inference/model_registry.py
+    get_alias) once monitoring should track whatever is actually promoted.
+  • AUTOML_EXP_ID = None / AUTOML_DEPLOYMENT_GROUP = "automl" are placeholders.
+    Wire them when the scheduled AutoML model exists (resolve the 'automl' alias).
+    Until then the AutoML trend lines are simply absent.
+
+PATHS / SCHEMA (schema.yaml):
+  • Requires a top-level `monitoring:` entry (output path) — I added it; make sure
+    it's committed.                                            → load_paths()
+  • The feature-importance JSON path is NOT in schema.yaml; it's built in code as
+    model_bank/experiments/{exp_id}/model/feature_importance_*.json. Adjust if the
+    model_training layout differs.                       → load_global_features()
+  • dcw_features_val_test_oot has no `category` column, so OOT is selected by a
+    join to label_store(category='oot').            → load_csi_baseline_values()
+
+================================================================================
+ WHAT THIS CODE DOES
+================================================================================
+Runs once per batch (right after batch inference) and writes, to
+monitoring/{batch_id}/ on R2, a metrics.json plus 5 dashboard PNGs:
+
+  performance.png            Macro F1 (P0) + Hamming Loss (P1) vs each model's T=0
+                             baseline, GYR-banded, as a time series.
+  stability.png              PSI (label-distribution drift) + CSI (top-50 feature
+                             drift) time series, GYR-banded.
+  psi_distribution.png       Reference: per-label expected-vs-actual prevalence.
+  csi_distribution.png       Reference: per-feature baseline-vs-production value
+                             histograms for all 50 global features.
+  csi_distribution_top3.png  Same, for the 3 most globally-important features.
+
+Two models are tracked as separate trend lines: the production champion and the
+latest AutoML challenger. Lines break at a model swap (promotion / AutoML retrain)
+so a change of model never looks like drift; each segment restarts at its own T=0.
+
+Metric families:
+  • Performance (needs ground truth → reviewed 10% only): Macro F1, Hamming Loss.
+  • PSI (predictions only → full batch): predicted-label distribution vs OOT.
+  • CSI (features only → full batch): top-50 global feature values vs OOT.
+
+History for the trend lines is rebuilt each run by reading prior metrics.json
+files back from monitoring/ (load_metric_history); there is no central index.
+'''
 from __future__ import annotations
 
 import argparse
@@ -7,7 +74,7 @@ import logging
 import math
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +84,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from include.inference.model_registry import hadoop_path_exists, read_json
+from include.inference.model_registry import hadoop_path_exists, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +133,11 @@ def load_paths(schema: dict) -> dict:
         # Served predictions; the reviewed 10% are a subset of each batch.
         "published_predictions": f"{gold_base}/{tables['published_predictions']['path']}",
         "model_bank_base": model_bank_base,
+        # CSI baseline: holdout DCW feature values (dcw_features map). Filtered to the
+        # OOT split via a join to label_store (this table has no category column).
+        "dcw_features_oot": f"{gold_base}/{tables['dcw_features_val_test_oot']['path']}",
+        # CSI production: assembled inference inputs (carries a dcw_features map for monitoring).
+        "inference_features": f"{gold_base}/{tables['inference_features']['path']}",
         # Per-batch monitoring artifacts: monitoring/{batch_id}/metrics.json + dashboard.png
         "monitoring_base": schema["monitoring"]["path"].rstrip("/"),
     }
@@ -221,6 +293,171 @@ def compute_psi(baseline_counts: dict, production_counts: dict, label_list: list
         "overall_psi": round(overall, 6),
         "overall_gyr": _classify_lower_is_better(overall, PSI_GREEN, PSI_YELLOW),
         "per_label": per_label,
+    }
+
+
+# ── CSI ingestion (covariate / feature stability) ──────────────────────────────
+#
+# CSI watches the production model's top-50 global features for distribution shift.
+# The feature LIST comes from the model's stored feature-importance JSON (global_top);
+# the baseline VALUE distribution is the model's OOT holdout features; production is
+# the same features on the live batch. All on full data — no ground truth needed.
+
+OOT_CATEGORY = "oot"
+
+
+def load_global_features(spark, paths: dict, exp_id: str = T0_EXP_ID) -> list[dict]:
+    """
+    The production model's global top-50 features (the CSI watch-list), read from its
+    stored feature-importance JSON (model_bank/experiments/{exp_id}/model/
+    feature_importance_*.json). Returns [{"name": "dcw:fighting", "lemma": "fighting"}]
+    — lemma is the dcw_features map key (the "dcw:" prefix is stripped).
+    """
+    model_dir = f"{paths['model_bank_base']}/experiments/{exp_id}/model"
+    fi_path = _latest_feature_importance(spark, model_dir)
+    if fi_path is None:
+        raise FileNotFoundError(f"No feature_importance_*.json found under {model_dir}")
+
+    feature_importance = read_json(spark, fi_path)
+    features = []
+    for row in feature_importance["global_top"]:
+        name = row["feature"]
+        lemma = name.split(":", 1)[1] if ":" in name else name
+        features.append({"name": name, "lemma": lemma})
+    logger.info("CSI: %d global features from %s", len(features), fi_path)
+    return features
+
+
+def _latest_feature_importance(spark, model_dir: str) -> str | None:
+    """Return the lexicographically latest feature_importance_*.json path, or None."""
+    candidates = [
+        child for child in _list_hadoop_children(spark, model_dir)
+        if child.rsplit("/", 1)[-1].startswith("feature_importance_") and child.endswith(".json")
+    ]
+    return max(candidates) if candidates else None
+
+
+def _extract_map_values(df, lemmas: list[str]) -> dict[str, list[float]]:
+    """
+    Collect per-document values of each lemma from the df's dcw_features map.
+    The map is sparse, so a missing key is a genuine 0 (feature did not fire) and is
+    coalesced to 0.0 rather than dropped — the zeros are part of the distribution.
+    """
+    from pyspark.sql import functions as F
+
+    columns = [F.coalesce(F.col("dcw_features")[lemma], F.lit(0.0)).alias(lemma) for lemma in lemmas]
+    rows = df.select(*columns).collect()
+    values: dict[str, list[float]] = {lemma: [] for lemma in lemmas}
+    for row in rows:
+        for lemma in lemmas:
+            values[lemma].append(float(row[lemma]))
+    return values
+
+
+def load_csi_baseline_values(spark, paths: dict, features: list[dict]) -> dict[str, list[float]]:
+    """
+    CSI baseline (expected): the production model's OOT holdout feature values for the
+    top-50 features. The OOT split is selected by joining the holdout DCW table to
+    label_store (category='oot'), since that table carries no category column itself.
+
+    Returns {lemma: [values across OOT docs]}.
+    """
+    from pyspark.sql import functions as F
+
+    oot_ids = (
+        spark.read.format("delta").load(paths["label_store"])
+        .filter(F.col("category") == OOT_CATEGORY)
+        .select("document_id")
+    )
+    holdout = spark.read.format("delta").load(paths["dcw_features_oot"])
+    oot_features = holdout.join(oot_ids, on="document_id", how="inner")
+    values = _extract_map_values(oot_features, [f["lemma"] for f in features])
+    logger.info("CSI baseline: %d OOT docs over %d features", len(next(iter(values.values()), [])), len(features))
+    return values
+
+
+def load_csi_production_values(spark, paths: dict, batch_id: str, features: list[dict]) -> dict[str, list[float]]:
+    """
+    CSI actual (production): the same top-50 feature values on the live batch.
+    Uses the full batch (10% reviewed subset is irrelevant — features need no labels):
+    the batch's documents come from published_predictions, joined to inference_features.
+
+    Returns {lemma: [values across batch docs]}.
+    [Assumption: inference_features carries a dcw_features map<string,double> keyed by
+    lemma, mirroring the holdout table, so the same extraction works on both sides.]
+    """
+    from pyspark.sql import functions as F
+
+    batch_ids = (
+        spark.read.format("delta").load(paths["published_predictions"])
+        .filter(F.col("batch_id") == batch_id)
+        .select("document_id").distinct()
+    )
+    inference = spark.read.format("delta").load(paths["inference_features"])
+    batch_features = inference.join(batch_ids, on="document_id", how="inner")
+    values = _extract_map_values(batch_features, [f["lemma"] for f in features])
+    logger.info("CSI production: %d batch docs over %d features", len(next(iter(values.values()), [])), len(features))
+    return values
+
+
+# CSI uses the same GYR thresholds as PSI (lower is better): GREEN < 0.10, etc.
+CSI_GREEN, CSI_YELLOW = 0.10, 0.25
+CSI_BINS = 10
+CSI_EPSILON = 1e-4
+
+
+def _feature_csi(baseline_values: list[float], production_values: list[float], n_bins: int = CSI_BINS) -> float:
+    """
+    CSI for one continuous feature: quantile-bin the baseline, score both sides into
+    those bins, then Σ (actual_frac - expected_frac) * ln(actual/expected).
+
+    DCW features are sparse (mostly 0). If the baseline is constant (e.g. never fires
+    in OOT), quantile edges collapse, so we fall back to zero-vs-nonzero bins to still
+    catch a firing-rate shift. Returns 0.0 when there is nothing to compare.
+    """
+    base = np.asarray(baseline_values, dtype=float)
+    prod = np.asarray(production_values, dtype=float)
+    if base.size == 0 or prod.size == 0:
+        return 0.0
+
+    edges = np.unique(np.quantile(base, np.linspace(0.0, 1.0, n_bins + 1)))
+    if edges.size < 2:  # degenerate baseline (typically all-zero) → presence/absence bins
+        edges = np.array([-np.inf, 1e-12, np.inf])
+    else:
+        edges[0], edges[-1] = -np.inf, np.inf  # capture production values outside the baseline range
+
+    base_hist, _ = np.histogram(base, bins=edges)
+    prod_hist, _ = np.histogram(prod, bins=edges)
+    expected = np.clip(base_hist / base_hist.sum(), CSI_EPSILON, None)
+    actual = np.clip(prod_hist / prod_hist.sum(), CSI_EPSILON, None)
+    return float(np.sum((actual - expected) * np.log(actual / expected)))
+
+
+def compute_csi(baseline_values: dict, production_values: dict, features: list[dict]) -> dict:
+    """
+    Per-feature CSI over the production model's top-50 global features, plus an
+    overall score. Overall CSI = the worst (max) single-feature CSI, so the GYR
+    thresholds (0.10 / 0.25) stay interpretable per feature and the worst-drifting
+    feature drives the alert. per_feature keeps each feature's CSI + GYR (and rank)
+    for the distribution plots and drill-down.
+    """
+    per_feature: dict[str, dict] = {}
+    overall = 0.0
+    for rank, feature in enumerate(features, start=1):
+        lemma = feature["lemma"]
+        csi = _feature_csi(baseline_values.get(lemma, []), production_values.get(lemma, []))
+        overall = max(overall, csi)
+        per_feature[lemma] = {
+            "name": feature["name"],
+            "rank": rank,  # global-importance rank (features arrive in global_top order)
+            "csi": round(csi, 6),
+            "gyr": _classify_lower_is_better(csi, CSI_GREEN, CSI_YELLOW),
+        }
+
+    return {
+        "overall_csi": round(overall, 6),
+        "overall_gyr": _classify_lower_is_better(overall, CSI_GREEN, CSI_YELLOW),
+        "per_feature": per_feature,
     }
 
 
@@ -383,7 +620,7 @@ TRACKED_MODELS = ("production", "automl")
 # Per-model metrics carried through the readback into the trend plots. Performance
 # metrics (macro_f1, hamming_loss) need ground truth; psi does not, so a point may
 # carry some metrics and not others. Each plot filters for the metric it draws.
-TRACKED_METRICS = ("macro_f1", "hamming_loss", "psi")
+TRACKED_METRICS = ("macro_f1", "hamming_loss", "psi", "csi")
 
 
 def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
@@ -620,72 +857,76 @@ def build_performance_plot(
     return buffer.read()
 
 
-# ── PSI trend plot ─────────────────────────────────────────────────────────────
+# ── Stability trend plot (PSI + CSI) ────────────────────────────────────────────
 
-# GYR zones for the overall PSI (lower is better). Mirrors the performance bands.
-PSI_BANDS = [(0.00, PSI_GREEN, "GREEN"), (PSI_GREEN, PSI_YELLOW, "YELLOW"), (PSI_YELLOW, 100.0, "RED")]
+# GYR zones for stability metrics (lower is better); same thresholds for PSI and CSI.
+STABILITY_BANDS = [(0.00, PSI_GREEN, "GREEN"), (PSI_GREEN, PSI_YELLOW, "YELLOW"), (PSI_YELLOW, 100.0, "RED")]
+
+# One subplot per stability metric: (point key, subplot title).
+STABILITY_METRICS = [
+    ("psi", "PSI — prediction stability (label distribution vs OOT)"),
+    ("csi", "CSI — feature stability (worst of top-50 features vs OOT)"),
+]
 
 
-def build_psi_plot(
+def build_stability_plot(
     series_by_model: dict[str, list[dict]],
     batch_id: str,
     generated_at: str,
 ) -> bytes:
     """
-    Render the PSI (prediction stability) time-series as PNG bytes — same style as
-    the performance plot but its own figure. One line per model, broken at model
-    swaps. No T=0 anchor: PSI is a production-vs-baseline drift score that only
-    exists once batches start (PSI≈0 means no shift).
+    Render the stability time-series (PSI on top, CSI below) as PNG bytes — same style
+    as the performance plot but its own figure and no T=0 anchor (stability is a
+    production-vs-baseline drift score that only exists once batches start; ≈0 = no
+    shift). One line per model, broken at model swaps.
 
-    series_by_model: {"production": [...], "automl": [...]} time-sorted points,
-        each carrying run_id and psi (the overall summed PSI for that batch).
+    series_by_model: {"production": [...], "automl": [...]} time-sorted points, each
+        carrying run_id, psi (overall summed PSI) and csi (overall worst-feature CSI).
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(1, 1, figsize=(11, 5))
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
     fig.suptitle(
-        f"PSI Monitoring — prediction stability — batch {batch_id}  ({generated_at[:19]} UTC)",
+        f"Stability Monitoring — batch {batch_id}  ({generated_at[:19]} UTC)",
         fontsize=12, fontweight="bold",
     )
 
-    y_max = PSI_YELLOW * 1.2  # ensure GYR bands are visible even when PSI is tiny
-    for low, high, gyr in PSI_BANDS:
-        ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
+    for ax, (key, title) in zip(axes, STABILITY_METRICS):
+        y_max = PSI_YELLOW * 1.2  # keep GYR bands visible even when the metric is tiny
+        for low, high, gyr in STABILITY_BANDS:
+            ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
 
-    for model, raw_series in series_by_model.items():
-        style = MODEL_STYLES[model]
-        series = [point for point in raw_series if point.get("psi") is not None]
-        for seg in _segments_by_run_id(series):
-            xs = [_point_time(p) for p in seg]
-            ys = [p["psi"] for p in seg]
-            if ys:
-                y_max = max(y_max, max(ys))
-            ax.plot(
-                xs, ys,
-                color=style["color"], marker=style["marker"],
-                linestyle=style["linestyle"], markersize=5, linewidth=1.6,
-                label=style["label"], zorder=3,
-            )
+        for model, raw_series in series_by_model.items():
+            style = MODEL_STYLES[model]
+            series = [point for point in raw_series if point.get(key) is not None]
+            for seg in _segments_by_run_id(series):
+                xs = [_point_time(p) for p in seg]
+                ys = [p[key] for p in seg]
+                if ys:
+                    y_max = max(y_max, max(ys))
+                ax.plot(
+                    xs, ys,
+                    color=style["color"], marker=style["marker"],
+                    linestyle=style["linestyle"], markersize=5, linewidth=1.6,
+                    label=style["label"], zorder=3,
+                )
 
-    ax.set_title(
-        "Overall PSI (one-bin per label, summed) — production vs OOT baseline",
-        fontsize=10, fontweight="bold", loc="left",
-    )
-    ax.set_ylabel("PSI")
-    ax.set_ylim(0, y_max * 1.1)
-    ax.grid(True, axis="y", alpha=0.2)
+        ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
+        ax.set_ylabel(key.upper())
+        ax.set_ylim(0, y_max * 1.1)
+        ax.grid(True, axis="y", alpha=0.2)
 
-    handles, labels = ax.get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    if unique:
-        ax.legend(unique.values(), unique.keys(), fontsize=7.5, loc="best")
+        handles, labels = ax.get_legend_handles_labels()
+        unique = dict(zip(labels, handles))
+        if unique:
+            ax.legend(unique.values(), unique.keys(), fontsize=7.5, loc="best")
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate(rotation=30)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
@@ -755,6 +996,92 @@ def build_psi_distribution_plot(
     return buffer.read()
 
 
+def build_csi_distribution_plot(
+    baseline_values: dict,
+    production_values: dict,
+    csi_result: dict,
+    features: list[dict],
+    batch_id: str,
+    generated_at: str,
+    top_n: int | None = None,
+) -> bytes:
+    """
+    Reference companion to the CSI trend: overlaid baseline (OOT) vs production value
+    histograms per feature, so the distribution shift behind each CSI is visible.
+
+    top_n=None  -> all features in a compact grid (the full top-50 reference).
+    top_n=3     -> just the most globally important features, large (presentation).
+
+    Each panel is titled with the feature name + its CSI, and the production
+    histogram is tinted by that feature's GYR. features arrive in global-importance
+    order, so features[:top_n] are the top-N.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    selected = features[:top_n] if top_n else features
+    n = len(selected)
+    ncols = min(n, 3) if top_n else 5
+    nrows = math.ceil(n / ncols)
+    scope = f"top {n}" if top_n else f"all {n}"
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.6, nrows * 2.6), squeeze=False)
+    fig.suptitle(
+        f"CSI Distribution (reference) — {scope} features — batch {batch_id}  ({generated_at[:19]} UTC)",
+        fontsize=12, fontweight="bold",
+    )
+
+    for idx, feature in enumerate(selected):
+        ax = axes[idx // ncols][idx % ncols]
+        lemma = feature["lemma"]
+        detail = csi_result["per_feature"].get(lemma, {})
+        base = np.asarray(baseline_values.get(lemma, []), dtype=float)
+        prod = np.asarray(production_values.get(lemma, []), dtype=float)
+
+        combined = np.concatenate([base, prod]) if base.size + prod.size else np.array([0.0, 1.0])
+        lo, hi = float(combined.min()), float(combined.max())
+        bins = np.linspace(lo, hi, 21) if hi > lo else np.linspace(lo - 0.5, lo + 0.5, 3)
+        actual_color = GYR_COLORS.get(detail.get("gyr", "GREEN"), MODEL_STYLES["production"]["color"])
+
+        base_n = prod_n = None
+        if base.size:
+            base_n, _, _ = ax.hist(base, bins=bins, density=True, color="#9E9E9E", alpha=0.55, label="Baseline (OOT)")
+        if prod.size:
+            prod_n, _, _ = ax.hist(prod, bins=bins, density=True, color=actual_color, alpha=0.55, label="Production")
+
+        # The 0-bin (feature absent) dwarfs everything; cap the y-axis to the tallest
+        # non-zero bin so the actual-value differences are visible. The 0 bar clips off.
+        nonzero_peak = 0.0
+        for heights in (base_n, prod_n):
+            if heights is not None and len(heights) > 1:
+                nonzero_peak = max(nonzero_peak, float(np.max(heights[1:])))
+        if nonzero_peak > 0:
+            ax.set_ylim(0, nonzero_peak * 1.15)
+
+        ax.set_title(f"{feature['name']}  (CSI={detail.get('csi', 0):.3f})", fontsize=8.5)
+        ax.tick_params(labelsize=6.5)
+        ax.set_yticks([])
+
+    # blank any unused grid cells
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+
+    # one shared legend + shared axis labels (per-panel labels would be too dense)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper right", fontsize=8)
+    fig.supxlabel("Feature value (DCW weight per document; 0 = feature absent)", fontsize=9)
+    fig.supylabel("Density (y capped to non-zero bins; 0-bar clipped)", fontsize=9)
+
+    fig.tight_layout(rect=[0.02, 0.03, 1, 0.95])
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
 def write_bytes(spark, path: str, data: bytes) -> None:
     """Write raw bytes (e.g. a PNG) to a Hadoop/R2 path, overwriting if present."""
     jvm = spark.sparkContext._jvm
@@ -768,8 +1095,155 @@ def write_bytes(spark, path: str, data: bytes) -> None:
     logger.info("Wrote %d bytes to %s", len(data), path)
 
 
+# ── Orchestration ───────────────────────────────────────────────────────────
+
+# Performance GYR thresholds. Macro F1: higher is better; Hamming Loss: lower.
+MACRO_F1_GREEN, MACRO_F1_YELLOW = 0.65, 0.60
+HAMMING_GREEN, HAMMING_YELLOW = 0.15, 0.20
+
+
+def _classify_higher_is_better(value: float, green: float, yellow: float) -> str:
+    if value >= green:
+        return "GREEN"
+    if value >= yellow:
+        return "YELLOW"
+    return "RED"
+
+
+def _filter_latest_run(series: list[dict]) -> list[dict]:
+    """Keep only the latest model's points (series is sorted oldest-first), so the
+    AutoML line shows only the current challenger version."""
+    if not series:
+        return series
+    latest_run_id = series[-1].get("run_id")
+    return [point for point in series if point.get("run_id") == latest_run_id]
+
+
+def _safe_plot(spark, path: str, builder) -> None:
+    """Build a PNG and write it; log and continue if it fails (monitoring must not
+    crash a whole run because one chart couldn't render)."""
+    try:
+        write_bytes(spark, path, builder())
+    except Exception as exc:
+        logger.warning("Could not render %s: %s", path, exc)
+
+
+def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[dict, dict | None, dict | None, dict | None]:
+    """
+    Compute the production model's metrics for this batch. Returns
+    (block, psi_result, csi_result, csi_values) where block is the per-model record
+    for metrics.json and the *_result objects feed the distribution plots.
+    Each metric family is best-effort: if an upstream table is missing (e.g. the
+    inference_features dcw_features map, or empty published_predictions) that family
+    is skipped with a warning rather than failing the whole run.
+    """
+    labels = t0["labels"]
+    block: dict = {"run_id": T0_EXP_ID}
+    psi_result = csi_result = csi_values = None
+
+    # Performance (needs ground truth → reviewed 10% only)
+    try:
+        performance = compute_performance(
+            load_ground_truth(spark, paths),
+            load_batch_predictions(spark, paths, batch_id),
+            labels,
+        )
+        if performance:
+            block["macro_f1"] = performance["macro_f1"]
+            block["hamming_loss"] = performance["hamming_loss"]
+            block["macro_f1_gyr"] = _classify_higher_is_better(performance["macro_f1"], MACRO_F1_GREEN, MACRO_F1_YELLOW)
+            block["hamming_loss_gyr"] = _classify_lower_is_better(performance["hamming_loss"], HAMMING_GREEN, HAMMING_YELLOW)
+            block["reviewed_count"] = performance["reviewed_count"]
+            block["per_label_f1"] = performance["per_label_f1"]
+    except Exception as exc:
+        logger.warning("Performance metrics unavailable: %s", exc)
+
+    # PSI (predictions only → full batch)
+    try:
+        psi_result = compute_psi(
+            load_baseline_prediction_counts(spark, t0["prediction_delta_path"]),
+            load_production_prediction_counts(spark, paths, batch_id),
+            labels,
+        )
+        block["psi"] = psi_result["overall_psi"]
+        block["psi_gyr"] = psi_result["overall_gyr"]
+        block["psi_per_label"] = psi_result["per_label"]
+    except Exception as exc:
+        logger.warning("PSI unavailable: %s", exc)
+
+    # CSI (features only → full batch)
+    try:
+        features = load_global_features(spark, paths, T0_EXP_ID)
+        baseline_values = load_csi_baseline_values(spark, paths, features)
+        production_values = load_csi_production_values(spark, paths, batch_id, features)
+        csi_result = compute_csi(baseline_values, production_values, features)
+        csi_values = {"features": features, "baseline": baseline_values, "production": production_values}
+        block["csi"] = csi_result["overall_csi"]
+        block["csi_gyr"] = csi_result["overall_gyr"]
+        block["csi_per_feature"] = csi_result["per_feature"]
+    except Exception as exc:
+        logger.warning("CSI unavailable: %s", exc)
+
+    return block, psi_result, csi_result, csi_values
+
+
 def run_monitoring(spark, batch_id: str) -> dict:
-    raise NotImplementedError
+    """
+    Daily entrypoint (runs right after batch inference). Computes performance / PSI /
+    CSI for the production model on this batch, writes metrics.json, then rebuilds the
+    trend history (now including this batch) and renders the 5 dashboard PNGs — all
+    under monitoring/{batch_id}/ on R2.
+
+    AutoML is a placeholder: until AUTOML_EXP_ID is set, only production is monitored
+    and the AutoML trend lines stay empty.
+    """
+    schema = load_schema()
+    paths = load_paths(schema)
+    monitored_at = datetime.now(timezone.utc).isoformat()
+    base_dir = f"{paths['monitoring_base']}/{batch_id}"
+    logger.info("Monitoring batch %s -> %s", batch_id, base_dir)
+
+    t0 = load_t0_baseline(spark, paths)
+    production, psi_result, csi_result, csi_values = _monitor_production(spark, paths, batch_id, t0)
+
+    # TODO: when AUTOML_EXP_ID is set, monitor the challenger the same way and put it here.
+    report = {
+        "batch_id": batch_id,
+        "monitored_at": monitored_at,
+        "production": production,
+        "automl": None,
+    }
+
+    # Persist first, so the history readback for the trend plots includes this batch.
+    write_json(spark, f"{base_dir}/metrics.json", report, overwrite=True)
+
+    # Trend plots: production champion + latest AutoML challenger over time.
+    history = load_metric_history(spark, paths)
+    history["automl"] = _filter_latest_run(history["automl"])
+    # T=0 baselines keyed by run_id (each model version anchors its own segment).
+    # NOTE: only the current production model's baseline is loaded here; historical
+    # promoted segments won't get a T=0 star until per-run_id baseline loading is added.
+    baselines = {T0_EXP_ID: {"macro_f1": t0["macro_f1"], "hamming_loss": t0["hamming_loss"], "date": t0["date"]}}
+
+    _safe_plot(spark, f"{base_dir}/performance.png",
+               lambda: build_performance_plot(history, baselines, batch_id, monitored_at))
+    _safe_plot(spark, f"{base_dir}/stability.png",
+               lambda: build_stability_plot(history, batch_id, monitored_at))
+    if psi_result:
+        _safe_plot(spark, f"{base_dir}/psi_distribution.png",
+                   lambda: build_psi_distribution_plot(psi_result, batch_id, monitored_at))
+    if csi_result and csi_values:
+        _safe_plot(spark, f"{base_dir}/csi_distribution.png",
+                   lambda: build_csi_distribution_plot(
+                       csi_values["baseline"], csi_values["production"], csi_result,
+                       csi_values["features"], batch_id, monitored_at))
+        _safe_plot(spark, f"{base_dir}/csi_distribution_top3.png",
+                   lambda: build_csi_distribution_plot(
+                       csi_values["baseline"], csi_values["production"], csi_result,
+                       csi_values["features"], batch_id, monitored_at, top_n=3))
+
+    logger.info("Monitoring complete for %s", batch_id)
+    return report
 
 
 def main() -> None:
