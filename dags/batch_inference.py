@@ -47,3 +47,15 @@ with DAG(
         execution_timeout=datetime.timedelta(hours=4),
         **COMMON,
     )
+
+    # Monitoring runs on the same batch (same ts_nodash batch-id) once predictions
+    # are published, computing performance / PSI / CSI and writing the dashboards to
+    # monitoring/{batch_id}/ on R2.
+    run_monitoring = DockerOperator(
+        task_id="run_monitoring",
+        command="python include/monitoring/monitoring.py --batch-id {{ ts_nodash }}",
+        execution_timeout=datetime.timedelta(hours=1),
+        **COMMON,
+    )
+
+    run_batch_inference >> run_monitoring
