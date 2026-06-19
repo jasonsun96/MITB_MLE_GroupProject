@@ -202,7 +202,8 @@ def model_bank_threshold_sweep_path(exp_id: str, batch_date: str | None = None) 
 
 def model_bank_run_root(run_id: str) -> str:
     """Deprecated: v1 path model_bank/runs/{id}. Use experiment or features root."""
-    return f"{legacy_storage_root('model_bank_runs')}/{run_id}"
+    schema = load_schema()
+    return f"{schema['model_bank']['path']}/runs/{run_id}"
 
 
 def model_bank_feature_extractor_dir(feature_run_id: str) -> str:
