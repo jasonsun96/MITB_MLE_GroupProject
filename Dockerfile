@@ -15,10 +15,7 @@ ENV PATH=$PATH:$JAVA_HOME/bin
 ENV JAVA_TOOL_OPTIONS="--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
 
 WORKDIR /app
-ENV PYTHONPATH=/app
-
-# Make /app importable so scripts under include/ can do `from utils...`
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app:/app/include
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -29,6 +26,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Swap URL to en_core_web_md or _trf later if accuracy on legal text is poor.
 RUN pip install --no-cache-dir \
     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# Bake NLTK corpora at build time. Runtime download from many Spark Python workers
+# races on the same zip and can corrupt stopwords (Bad CRC-32 / truncated header).
+RUN python -c "import nltk; \
+    nltk.download('stopwords', quiet=True); \
+    nltk.download('wordnet', quiet=True); \
+    nltk.download('omw-1.4', quiet=True); \
+    from nltk.corpus import stopwords; \
+    assert len(stopwords.words('english')) > 0"
 
 # Pre-download Legal-BERT into the image so containers start instantly. About
 # 440 MB. Cached at /root/.cache/huggingface/hub/. Swap the model name if we

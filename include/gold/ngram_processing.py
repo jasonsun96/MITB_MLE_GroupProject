@@ -6,7 +6,7 @@ per-document raw n-gram count maps to gold. No corpus vocabulary is fitted here;
 TF-IDF vocabulary/IDF fitting happens later in a separate model-bank job on
 train data only.
 
-schema (gold/ngram_count):
+schema (gold/ngrams):
   document_id, labels, snapshot_date
   tokens, token_count
   ngram_counts: {ngram_string: count}   e.g. {"sample": 2, "sample text": 1}
@@ -47,7 +47,7 @@ TEXT_COLUMN = "act_raw_text"
 LABEL_COLUMN = "labels"
 ID_COLUMN = "CELEX"
 LEGAL_SILVER_TABLE = "legal_docs_processed"
-NGRAM_COUNT_TABLE = "ngram_count"
+NGRAM_CORPUS_TABLE = "ngrams"
 
 SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schema.yaml"
 
@@ -184,7 +184,7 @@ def main():
     silver = schema["silver"]
     gold = schema["gold"]
     INPUT_PATH = f"{silver['path']}/{silver['tables'][LEGAL_SILVER_TABLE]['path']}"
-    OUTPUT_PATH = f"{gold['path']}/{gold['tables'][NGRAM_COUNT_TABLE]['path']}"
+    OUTPUT_PATH = f"{gold['path']}/{gold['corpus'][NGRAM_CORPUS_TABLE]['path']}"
 
     logger.info("Input  (silver): %s", INPUT_PATH)
     logger.info("Output (gold)  : %s", OUTPUT_PATH)

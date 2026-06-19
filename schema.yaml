@@ -42,48 +42,72 @@ silver:
 
 gold:
   path: "s3a://cs611-project/gold"
-  tables:
-    sample_gold:
-      path: sample_gold
-    ngram_count:
-      path: ngram_count
+  # Corpus-level tables (not split-dependent, not versioned by feature run)
+  corpus:
+    ngrams:
+      path: ngrams
       partition_col: snapshot_date
-    tfidf_features_train:
-      path: tfidf_features_train
-    tfidf_features_val_test_oot:
-      path: tfidf_features_val_test_oot
-    pos_counts:
-      path: pos_counts
+    pos_tags:
+      path: pos_tags
       partition_col: snapshot_date
-    pos_counts_wiki:
-      path: pos_counts_wiki
-    dcw_features_train:
-      path: dcw_features_train
-    dcw_features_val_test_oot:
-      path: dcw_features_val_test_oot
+    pos_tags_wiki:
+      path: pos_tags_wiki
     embeddings:
       path: embeddings
       partition_col: snapshot_date
     embeddings_wiki:
       path: embeddings_wiki
+      partition_col: snapshot_date
     label_store:
       path: label_store
       partition_col: snapshot_date
+    # Split + raw label strings; reads existing label_store on R2 (no re-run needed).
     labels:
-      path: labels
-    model_prediction:
-      path: model_prediction
-    runs:
-      path: runs
+      path: label_store
+      partition_col: snapshot_date
+  # Flat paths from pre-migration runs (left on R2 for reference; superseded by runs/)
+  legacy:
+    ngram_count: ngram_count
+    pos_counts: pos_counts
+    pos_counts_wiki: pos_counts_wiki
+    tfidf_features_train: tfidf_features_train
+    tfidf_features_val_test_oot: tfidf_features_val_test_oot
+    dcw_features_train: dcw_features_train
+    dcw_features_val_test_oot: dcw_features_val_test_oot
+  # Versioned feature / training matrices per pipeline run (run001, run002, ...)
+  runs:
+    base: runs
+    default_run_id: run001
+    default_gold_run_id: run001
+    tfidf_train: tfidf_train
+    tfidf_val_test_oot: tfidf_val_test_oot
+    tfidf_svd_train: tfidf_svd_train
+    tfidf_svd_val_test_oot: tfidf_svd_val_test_oot
+    dcw_train: dcw_train
+    dcw_val_test_oot: dcw_val_test_oot
+    X_train: X_train
+    X_val_test_oot: X_val_test_oot
+    X_unlabelled: X_unlabelled
+  model_predictions:
+    base: model_predictions
+    date_partition_prefix: prediction_date=
+    default_exp_id: null
 
 model_bank:
   path: "s3a://cs611-project/model_bank"
-  runs:
-    path: runs
-  features_extractor:
-    tfidf:
-      path: features_extractor/tfidf
-      vocab_file: gold_vocab_1_3.json
-      meta_file: gold_meta_1_3.json
-    dcw_score: features_extractor/dcw_score
-    dcw_train_doc_ids: features_extractor/dcw_train_doc_ids
+  features:
+    base: features
+    tfidf_pkl: tfidf.pkl
+    tfidf_svd_pkl: tfidf_svd.pkl
+    dcw_pkl: dcw.pkl
+    tfidf_json_dir: tfidf
+    dcw_score: dcw_score
+    dcw_train_doc_ids: dcw_train_doc_ids
+  experiments:
+    base: experiments
+    model_dir: model
+    manifest_dir: manifest
+    metrics_dir: metrics
+    feature_importance_dir: feature_importance
+    per_label_subdir: per_label
+    default_model_name: random_forest

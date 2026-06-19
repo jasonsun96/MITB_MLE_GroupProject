@@ -58,7 +58,7 @@ if args.input_layer == "bronze":
 else:
     INPUT_PATH = f"{schema['silver']['path']}/{schema['silver']['tables']['wiki_docs_processed']['path']}"
 
-OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['embeddings_wiki']['path']}"
+OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['corpus']['embeddings_wiki']['path']}"
 
 logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
 logger.info(f"Output (gold)             : {OUTPUT_PATH}")
