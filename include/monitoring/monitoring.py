@@ -25,9 +25,9 @@ MODEL RESOLUTION (hardcoded, but need to be wired to correct path once done):
   • T0_EXP_ID = "exp004_LR_tfidf_dcw_gs" is the assumed PRODUCTION model. Replace
     with a lookup of the 'production' alias (include/inference/model_registry.py
     get_alias) once monitoring should track whatever is actually promoted.
-  • AUTOML_EXP_ID = None / AUTOML_DEPLOYMENT_GROUP = "automl" are placeholders.
-    Wire them when the scheduled AutoML model exists (resolve the 'automl' alias).
-    Until then the AutoML trend lines are simply absent.
+  • SHADOW_MODEL_PATH = None disables the optional shadow model. To explore one,
+    hardcode the R2 path to its predictions table there; its performance then plots
+    as a second line on the performance dashboard.
 
 PATHS / SCHEMA (schema.yaml):
   • Requires a top-level `monitoring:` entry (output path) — I added it; make sure
@@ -35,27 +35,31 @@ PATHS / SCHEMA (schema.yaml):
   • The feature-importance JSON path is NOT in schema.yaml; it's built in code as
     model_bank/experiments/{exp_id}/model/feature_importance_*.json. Adjust if the
     model_training layout differs.                       → load_global_features()
-  • dcw_features_val_test_oot has no `category` column, so OOT is selected by a
-    join to label_store(category='oot').            → load_csi_baseline_values()
+  • Baselines come from the v2 gold layout (built in code, not schema tables):
+    CSI training features = gold/runs/{feature_run_id}/dcw_train; PSI training
+    predictions = gold/model_predictions/prediction_date=*/{exp_id}_train (latest).
+                  → load_csi_baseline_values(), resolve_train_predictions_path()
 
 ================================================================================
  WHAT THIS CODE DOES
 ================================================================================
 Runs once per batch (right after batch inference) and writes, to
-monitoring/{batch_id}/ on R2, a metrics.json plus 5 dashboard PNGs:
+monitoring/{batch_id}/ on R2, a metrics.json plus the dashboard PNGs:
 
-  performance.png            Macro F1 (P0) + Hamming Loss (P1) vs each model's T=0
-                             baseline, GYR-banded, as a time series.
-  stability.png              PSI (label-distribution drift) + CSI (top-50 feature
-                             drift) time series, GYR-banded.
-  psi_distribution.png       Reference: per-label expected-vs-actual prevalence.
-  csi_distribution.png       Reference: per-feature baseline-vs-production value
-                             histograms for all 50 global features.
-  csi_distribution_top3.png  Same, for the 3 most globally-important features.
+  performance.png               Macro F1 (P0) + Hamming Loss (P1) vs each model's T=0
+                                baseline, GYR-banded, as a time series.
+  stability.png                 PSI (label-distribution drift) + CSI (top-50 feature
+                                drift) time series, GYR-banded.
+  psi_distribution.png          Reference: per-label expected-vs-actual prevalence.
+  csi_distribution.png          Reference: per-feature baseline-vs-production value
+                                histograms for all 50 global features.
+  csi_distribution_top3.png     Same, for the 3 most globally-important features.
+  csi_feature_trends.png        Per-feature CSI over time, all 50 (grid).
+  csi_feature_trends_top3.png   Per-feature CSI over time, top 3 (overlaid).
 
-Two models are tracked as separate trend lines: the production champion and the
-latest AutoML challenger. Lines break at a model swap (promotion / AutoML retrain)
-so a change of model never looks like drift; each segment restarts at its own T=0.
+The production champion is tracked as a trend line; an optional shadow model adds a
+second line on the performance plot. Lines break at a model swap (promotion) so a
+change of model never looks like drift; each segment restarts at its own T=0.
 
 Metric families:
   • Performance (needs ground truth → reviewed 10% only): Macro F1, Hamming Loss.
@@ -102,17 +106,19 @@ T0_METRICS_SPLIT = "holdout_oot"
 # appends reviewed production docs to label_store with category='production'.]
 REVIEWED_CATEGORY = "production"
 
-# Challenger model trained by the scheduled AutoML job (3-monthly). It is
-# evaluated on the same reviewed 10% as production; promotion to champion
-# requires Macro F1 to exceed production by >=15% for 1 month.
-# No AutoML model exists yet (training is scheduled), so this is None for now.
-# When the AutoML job lands, set this to its experiment id (or resolve it from a
-# model_registry alias, e.g. get_alias(..., "automl")).
-AUTOML_EXP_ID: str | None = None
+# Optional SHADOW model: a second model scored alongside production for comparison
+# (exploratory). When set, its performance is plotted as a separate line on the
+# performance dashboard; when None (default) no shadow is tracked or plotted.
+#
+# >>> HARDCODE THE SHADOW MODEL PATH HERE (R2 path to the shadow model's
+#     predictions table for the batch; None disables the shadow entirely). <<<
+SHADOW_MODEL_PATH: str | None = None
 
-# How the AutoML challenger's served predictions are distinguished within
-# published_predictions once it runs. Placeholder until the AutoML job defines it.
-AUTOML_DEPLOYMENT_GROUP = "automl"
+# v2 gold-layout directories (under gold/) that monitoring reads for its TRAINING
+# baselines. These are NOT in this branch's schema.yaml, so they are hardcoded here.
+# Reconcile with schema.yaml if/when the model_training (v2) branch is merged in.
+GOLD_RUNS_DIR = "runs"                          # gold/runs/{feature_run_id}/dcw_train (CSI baseline)
+GOLD_MODEL_PREDICTIONS_DIR = "model_predictions"  # gold/model_predictions/prediction_date=*/{exp_id}_train (PSI baseline)
 
 
 def load_schema() -> dict:
@@ -133,9 +139,12 @@ def load_paths(schema: dict) -> dict:
         # Served predictions; the reviewed 10% are a subset of each batch.
         "published_predictions": f"{gold_base}/{tables['published_predictions']['path']}",
         "model_bank_base": model_bank_base,
-        # CSI baseline: holdout DCW feature values (dcw_features map). Filtered to the
-        # OOT split via a join to label_store (this table has no category column).
-        "dcw_features_oot": f"{gold_base}/{tables['dcw_features_val_test_oot']['path']}",
+        # v2 layout bases. These dirs are NOT in this branch's schema.yaml, so they
+        # are hardcoded here (see GOLD_RUNS_DIR / GOLD_MODEL_PREDICTIONS_DIR).
+        # CSI training baseline = {runs_base}/{feature_run_id}/dcw_train;
+        # PSI training baseline = {model_predictions_base}/prediction_date=*/{exp_id}_train.
+        "runs_base": f"{gold_base}/{GOLD_RUNS_DIR}",
+        "model_predictions_base": f"{gold_base}/{GOLD_MODEL_PREDICTIONS_DIR}",
         # CSI production: assembled inference inputs (carries a dcw_features map for monitoring).
         "inference_features": f"{gold_base}/{tables['inference_features']['path']}",
         # Per-batch monitoring artifacts: monitoring/{batch_id}/metrics.json + dashboard.png
@@ -170,12 +179,12 @@ def load_batch_predictions(spark, paths: dict, batch_id: str):
 # PSI compares the model's PREDICTED label distribution at baseline vs production.
 # Both sides are predicted_labels (not ground truth): this isolates distribution
 # shift and avoids contaminating it with the model's inherent prediction bias.
-# Baseline = predicted labels on the production model's OOT holdout (its reference
-# scoring); production = predicted labels on the live batch.
+# Baseline = predicted labels on the production model's TRAINING set (its in-sample
+# reference scoring); production = predicted labels on the live batch.
 
-# Holdout split that defines the PSI baseline distribution. OOT is the closest
-# analogue to future/production data and matches the performance T=0 (holdout_oot).
-PSI_BASELINE_SPLIT = "oot"
+# Split that defines the PSI baseline distribution: the model's predictions on its
+# own training set (the dedicated {exp_id}_train predictions table, category='train').
+PSI_BASELINE_SPLIT = "train"
 
 
 def _predicted_label_counts(df) -> dict:
@@ -199,25 +208,41 @@ def _predicted_label_counts(df) -> dict:
 
 def load_baseline_prediction_counts(spark, reference_path: str) -> dict:
     """
-    PSI baseline (expected): the production model's predicted-label prevalence on
-    its OOT holdout. reference_path is the model's prediction_delta_path (from its
-    metrics JSON), so the baseline is pinned to whatever model is in production.
+    PSI baseline (expected): the production model's predicted-label prevalence on its
+    TRAINING set. reference_path is the model's train-predictions table
+    (gold/model_predictions/prediction_date=*/{exp_id}_train), pinned to production.
 
-    Returns {"total": <#oot docs>, "counts": {label: <#docs predicted label>}}.
+    Returns {"total": <#train docs>, "counts": {label: <#docs predicted label>}}.
     """
     from pyspark.sql import functions as F
 
     if not reference_path:
-        raise ValueError("No reference prediction path for the production model (PSI baseline)")
+        raise ValueError("No train-predictions path for the production model (PSI baseline)")
 
     reference = spark.read.format("delta").load(reference_path)
-    oot = reference.filter(F.col("category") == PSI_BASELINE_SPLIT)
-    result = _predicted_label_counts(oot)
+    train = reference.filter(F.col("category") == PSI_BASELINE_SPLIT)
+    result = _predicted_label_counts(train)
     logger.info(
         "PSI baseline: %d %s docs from %s, %d distinct predicted labels",
         result["total"], PSI_BASELINE_SPLIT, reference_path, len(result["counts"]),
     )
     return result
+
+
+def resolve_train_predictions_path(spark, paths: dict, exp_id: str) -> str | None:
+    """
+    Find the production model's train-predictions table by scanning
+    gold/model_predictions/prediction_date=*/{exp_id}_train and taking the latest
+    date. Returns None if none exists. (This table isn't referenced by the model's
+    metrics JSON, hence the scan; convention is the '{exp_id}_train' folder name.)
+    """
+    model_predictions_base = paths["model_predictions_base"]
+    candidates = []
+    for date_dir in _list_hadoop_children(spark, model_predictions_base):
+        candidate = f"{date_dir.rstrip('/')}/{exp_id}_train"
+        if hadoop_path_exists(spark, candidate):
+            candidates.append(candidate)
+    return max(candidates) if candidates else None
 
 
 def load_production_prediction_counts(spark, paths: dict, batch_id: str) -> dict:
@@ -300,10 +325,8 @@ def compute_psi(baseline_counts: dict, production_counts: dict, label_list: list
 #
 # CSI watches the production model's top-50 global features for distribution shift.
 # The feature LIST comes from the model's stored feature-importance JSON (global_top);
-# the baseline VALUE distribution is the model's OOT holdout features; production is
-# the same features on the live batch. All on full data — no ground truth needed.
-
-OOT_CATEGORY = "oot"
+# the baseline VALUE distribution is the model's TRAINING features (dcw_train);
+# production is the same features on the live batch. All on full data — no labels.
 
 
 def load_global_features(spark, paths: dict, exp_id: str = T0_EXP_ID) -> list[dict]:
@@ -354,25 +377,20 @@ def _extract_map_values(df, lemmas: list[str]) -> dict[str, list[float]]:
     return values
 
 
-def load_csi_baseline_values(spark, paths: dict, features: list[dict]) -> dict[str, list[float]]:
+def load_csi_baseline_values(spark, paths: dict, features: list[dict], feature_run_id: str) -> dict[str, list[float]]:
     """
-    CSI baseline (expected): the production model's OOT holdout feature values for the
-    top-50 features. The OOT split is selected by joining the holdout DCW table to
-    label_store (category='oot'), since that table carries no category column itself.
+    CSI baseline (expected): the production model's TRAINING feature values for the
+    top-50 features, from gold/runs/{feature_run_id}/dcw_train (v2 layout). The whole
+    table is the train split, so no category filter is needed; dcw_features is a map
+    keyed by lemma (same shape as the production side).
 
-    Returns {lemma: [values across OOT docs]}.
+    Returns {lemma: [values across train docs]}.
     """
-    from pyspark.sql import functions as F
-
-    oot_ids = (
-        spark.read.format("delta").load(paths["label_store"])
-        .filter(F.col("category") == OOT_CATEGORY)
-        .select("document_id")
-    )
-    holdout = spark.read.format("delta").load(paths["dcw_features_oot"])
-    oot_features = holdout.join(oot_ids, on="document_id", how="inner")
-    values = _extract_map_values(oot_features, [f["lemma"] for f in features])
-    logger.info("CSI baseline: %d OOT docs over %d features", len(next(iter(values.values()), [])), len(features))
+    dcw_train_path = f"{paths['runs_base']}/{feature_run_id}/dcw_train"
+    train = spark.read.format("delta").load(dcw_train_path)
+    values = _extract_map_values(train, [f["lemma"] for f in features])
+    logger.info("CSI baseline: %d train docs from %s over %d features",
+                len(next(iter(values.values()), [])), dcw_train_path, len(features))
     return values
 
 
@@ -540,9 +558,9 @@ def load_t0_baseline(spark, paths: dict) -> dict:
         # Evaluation date (from the prediction_YYYYMMDD filename) becomes the
         # x-position of the T=0 point that anchors the start of the model's line.
         "date": _parse_metrics_date(metrics_path),
-        # Reference prediction table (holdout predictions) for this model; used as
-        # the PSI baseline so the expected distribution is the model's own outputs.
-        "prediction_delta_path": metrics.get("prediction_delta_path"),
+        # Feature run id (e.g. "run001") locates the model's gold/runs/{id}/dcw_train
+        # table used as the CSI training baseline.
+        "feature_run_id": metrics.get("feature_run_id"),
     }
 
 
@@ -555,66 +573,31 @@ def _parse_metrics_date(metrics_path: str) -> str | None:
     return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
 
 
-def load_automl_baseline(spark, paths: dict) -> dict | None:
+def load_shadow_performance(spark, paths: dict, batch_id: str, label_list: list[str]) -> dict | None:
     """
-    Load the AutoML challenger's T=0 baseline metrics, mirroring load_t0_baseline.
-
-    PLACEHOLDER: the AutoML job is scheduled and no model exists yet, so this
-    returns None until AUTOML_EXP_ID is set. Once wired up, this reads the
-    challenger's holdout metrics so its T=0 can be compared against production.
+    Optional shadow-model performance for this batch (exploratory). Returns None when
+    no shadow model is configured (SHADOW_MODEL_PATH is None), so the shadow line is
+    simply absent. When configured, SHADOW_MODEL_PATH is the shadow model's
+    predictions table (expected columns: document_id, predicted_labels, and batch_id
+    if multi-batch); its predictions on the reviewed 10% are scored against ground
+    truth, exactly like production.
     """
-    if AUTOML_EXP_ID is None:
-        logger.info("No AutoML model configured (AUTOML_EXP_ID is None); skipping AutoML baseline")
-        return None
-
-    metrics_dir = f"{paths['model_bank_base']}/experiments/{AUTOML_EXP_ID}/metrics"
-    metrics_path = _latest_prediction_metrics(spark, metrics_dir)
-    if metrics_path is None:
-        logger.warning("AutoML model %s has no baseline metrics yet at %s", AUTOML_EXP_ID, metrics_dir)
-        return None
-
-    logger.info("Loading AutoML baseline metrics from %s", metrics_path)
-    metrics = read_json(spark, metrics_path)
-    split_metrics = metrics["metrics"][T0_METRICS_SPLIT]
-    return {
-        "exp_id": AUTOML_EXP_ID,
-        "split": T0_METRICS_SPLIT,
-        "macro_f1": split_metrics["macro_f1"],
-        "hamming_loss": split_metrics["hamming_loss"],
-    }
-
-
-def load_automl_predictions(spark, paths: dict, batch_id: str):
-    """
-    Load the AutoML challenger's predictions on the reviewed 10% for one batch,
-    mirroring load_batch_predictions, so its live Macro F1 can be computed.
-
-    PLACEHOLDER: returns None until the scheduled AutoML job runs and serves
-    predictions (expected within published_predictions, distinguished by
-    deployment_group=AUTOML_DEPLOYMENT_GROUP, or a dedicated table TBD).
-    """
-    if AUTOML_EXP_ID is None:
-        logger.info("No AutoML model configured (AUTOML_EXP_ID is None); skipping AutoML predictions")
+    if SHADOW_MODEL_PATH is None:
         return None
 
     from pyspark.sql import functions as F
 
-    predictions = spark.read.format("delta").load(paths["published_predictions"])
-    automl_preds = predictions.filter(
-        (F.col("batch_id") == batch_id)
-        & (F.col("deployment_group") == AUTOML_DEPLOYMENT_GROUP)
-    ).select("document_id", "predicted_labels")
-
-    if automl_preds.limit(1).count() == 0:
-        logger.warning("No AutoML predictions found for batch %s", batch_id)
-        return None
-    return automl_preds
+    shadow_predictions = spark.read.format("delta").load(SHADOW_MODEL_PATH)
+    if "batch_id" in shadow_predictions.columns:
+        shadow_predictions = shadow_predictions.filter(F.col("batch_id") == batch_id)
+    shadow_predictions = shadow_predictions.select("document_id", "predicted_labels")
+    return compute_performance(load_ground_truth(spark, paths), shadow_predictions, label_list)
 
 
-# Models whose daily performance is tracked as its own trend line. Production is
-# the champion; automl is the latest challenger (the 'automl' alias is repointed
-# to a fresh model every 3-month cycle, so this line tracks "latest AutoML").
-TRACKED_MODELS = ("production", "automl")
+# Models tracked as their own trend line. Production is the champion; shadow is an
+# optional comparison model (see SHADOW_MODEL_PATH) — its series stays empty unless
+# a shadow model is configured, and only carries performance metrics.
+TRACKED_MODELS = ("production", "shadow")
 
 
 # Per-model metrics carried through the readback into the trend plots. Performance
@@ -628,7 +611,7 @@ def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
     Read back prior runs' metric points from monitoring/{batch_id}/metrics.json so
     each daily run can plot time-series lines (performance and PSI) rather than dots.
 
-    Returns one series per tracked model: {"production": [...], "automl": [...]}.
+    Returns one series per tracked model: {"production": [...], "shadow": [...]}.
     Each point carries run_id (so a plot can break the line at a model swap) plus
     every tracked metric (macro_f1, hamming_loss, psi); any metric absent that day
     is None and is filtered out by the plot that draws it. Points are sorted
@@ -665,6 +648,47 @@ def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
         history[model].sort(key=lambda point: point.get("monitored_at") or point.get("batch_id") or "")
         logger.info("Loaded %d prior %s point(s) from %s", len(history[model]), model, monitoring_base)
 
+    return history
+
+
+def load_csi_feature_history(spark, paths: dict, model: str = "production") -> dict[str, list[dict]]:
+    """
+    Read back the PER-FEATURE CSI over time from monitoring/{batch_id}/metrics.json
+    (block[model]["csi_per_feature"]), so each of the top-50 features can be plotted
+    as its own CSI trend. Returns {lemma: [{monitored_at, batch_id, run_id, csi,
+    gyr}, ...]} sorted oldest-first. Empty when no history (or no CSI) exists yet.
+    """
+    monitoring_base = paths["monitoring_base"]
+    history: dict[str, list[dict]] = {}
+
+    for batch_dir in _list_hadoop_children(spark, monitoring_base):
+        metrics_path = f"{batch_dir.rstrip('/')}/metrics.json"
+        if not hadoop_path_exists(spark, metrics_path):
+            continue
+        try:
+            report = read_json(spark, metrics_path)
+        except Exception as exc:  # tolerate a single corrupt/partial file
+            logger.warning("Skipping unreadable monitoring file %s: %s", metrics_path, exc)
+            continue
+
+        block = report.get(model)
+        if not block:
+            continue
+        run_id = block.get("run_id")
+        for lemma, detail in (block.get("csi_per_feature") or {}).items():
+            if detail.get("csi") is None:
+                continue
+            history.setdefault(lemma, []).append({
+                "monitored_at": report.get("monitored_at"),
+                "batch_id": report.get("batch_id"),
+                "run_id": run_id,
+                "csi": detail["csi"],
+                "gyr": detail.get("gyr"),
+            })
+
+    for lemma in history:
+        history[lemma].sort(key=lambda point: point.get("monitored_at") or point.get("batch_id") or "")
+    logger.info("Loaded per-feature CSI history for %d features", len(history))
     return history
 
 
@@ -711,10 +735,11 @@ PERF_METRICS = [
     ("hamming_loss", "Hamming Loss (P1)", HAMMING_BANDS, (0.00, 0.30)),
 ]
 
-# Per-model line styling. Production is the champion; automl is the latest challenger.
+# Per-model line styling. Production is the champion; shadow is the optional
+# comparison model (drawn only when a shadow model is configured).
 MODEL_STYLES = {
     "production": {"color": "#1565C0", "marker": "o", "linestyle": "-", "label": "Production"},
-    "automl": {"color": "#6A1B9A", "marker": "D", "linestyle": "--", "label": "AutoML (latest)"},
+    "shadow": {"color": "#6A1B9A", "marker": "D", "linestyle": "--", "label": "Shadow"},
 }
 
 
@@ -785,9 +810,9 @@ def build_performance_plot(
     """
     Render the performance time-series dashboard as PNG bytes.
 
-    series_by_model: {"production": [...], "automl": [...]} time-sorted points,
-        each {monitored_at, batch_id, run_id, macro_f1, hamming_loss}. The AutoML
-        series is expected pre-filtered to the latest model only.
+    series_by_model: {"production": [...], "shadow": [...]} time-sorted points, each
+        {monitored_at, batch_id, run_id, macro_f1, hamming_loss}. The shadow series
+        is empty (and no shadow line drawn) unless a shadow model is configured.
     baselines: T=0 reference keyed by run_id, {run_id: {macro_f1, hamming_loss,
         date}}. Each model version has its own baseline; when production is
         promoted, the new model's segment restarts at its own T=0.
@@ -880,8 +905,9 @@ def build_stability_plot(
     production-vs-baseline drift score that only exists once batches start; ≈0 = no
     shift). One line per model, broken at model swaps.
 
-    series_by_model: {"production": [...], "automl": [...]} time-sorted points, each
+    series_by_model: {"production": [...], "shadow": [...]} time-sorted points, each
         carrying run_id, psi (overall summed PSI) and csi (overall worst-feature CSI).
+        Shadow only carries performance, so it has no PSI/CSI line here.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1082,6 +1108,132 @@ def build_csi_distribution_plot(
     return buffer.read()
 
 
+# ── Per-feature CSI trend plots ─────────────────────────────────────────────────
+
+# Distinct line colours for the top-N feature comparison.
+TOP_FEATURE_COLORS = ["#1565C0", "#6A1B9A", "#C62828", "#2E7D32", "#EF6C00"]
+
+
+def build_csi_feature_grid_plot(
+    feature_history: dict[str, list[dict]],
+    features: list[dict],
+    batch_id: str,
+    generated_at: str,
+) -> bytes:
+    """
+    A grid of mini CSI trends — one panel per top-50 feature — so every feature's
+    drift over time is visible at a glance (the per-feature counterpart to the single
+    aggregate CSI line on the stability plot). Panels are in global-importance order.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    n = len(features)
+    ncols = 5
+    nrows = math.ceil(n / ncols)
+    color = MODEL_STYLES["production"]["color"]
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.4, nrows * 2.2), squeeze=False, sharex=True)
+    fig.suptitle(
+        f"CSI per feature (trend) — all {n} features — batch {batch_id}  ({generated_at[:19]} UTC)",
+        fontsize=12, fontweight="bold",
+    )
+
+    for idx, feature in enumerate(features):
+        ax = axes[idx // ncols][idx % ncols]
+        for low, high, gyr in STABILITY_BANDS:
+            ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
+
+        series = feature_history.get(feature["lemma"], [])
+        y_max = PSI_YELLOW * 1.2
+        for seg in _segments_by_run_id(series):
+            xs = [_point_time(p) for p in seg]
+            ys = [p["csi"] for p in seg]
+            if ys:
+                y_max = max(y_max, max(ys))
+            ax.plot(xs, ys, color=color, marker="o", markersize=2.5, linewidth=1.0, zorder=3)
+
+        ax.set_ylim(0, y_max * 1.1)
+        ax.set_title(feature["name"], fontsize=8)
+        ax.tick_params(labelsize=6)
+
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+
+    axes[-1][0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    fig.autofmt_xdate(rotation=45)
+    fig.supylabel("CSI (GYR bands 0.10 / 0.25)", fontsize=9)
+    fig.tight_layout(rect=[0.01, 0, 1, 0.96])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def build_csi_top_features_plot(
+    feature_history: dict[str, list[dict]],
+    features: list[dict],
+    batch_id: str,
+    generated_at: str,
+    top_n: int = 3,
+) -> bytes:
+    """
+    The top-N most globally-important features' CSI trends overlaid on one chart, so
+    they can be compared directly. One coloured line per feature, broken at model
+    swaps, over the shared GYR bands. features arrive in global-importance order.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    selected = features[:top_n]
+    fig, ax = plt.subplots(1, 1, figsize=(11, 5))
+    fig.suptitle(
+        f"CSI — top {len(selected)} features by global importance — batch {batch_id}  ({generated_at[:19]} UTC)",
+        fontsize=12, fontweight="bold",
+    )
+
+    y_max = PSI_YELLOW * 1.2
+    for low, high, gyr in STABILITY_BANDS:
+        ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
+
+    for index, feature in enumerate(selected):
+        color = TOP_FEATURE_COLORS[index % len(TOP_FEATURE_COLORS)]
+        series = feature_history.get(feature["lemma"], [])
+        labelled = False
+        for seg in _segments_by_run_id(series):
+            xs = [_point_time(p) for p in seg]
+            ys = [p["csi"] for p in seg]
+            if ys:
+                y_max = max(y_max, max(ys))
+            ax.plot(
+                xs, ys, color=color, marker="o", markersize=5, linewidth=1.6,
+                label=feature["name"] if not labelled else None, zorder=3,
+            )
+            labelled = True
+
+    ax.set_title("Per-feature CSI vs OOT baseline", fontsize=10, fontweight="bold", loc="left")
+    ax.set_ylabel("CSI")
+    ax.set_ylim(0, y_max * 1.1)
+    ax.grid(True, axis="y", alpha=0.2)
+    ax.legend(fontsize=8, loc="best")
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate(rotation=30)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
 def write_bytes(spark, path: str, data: bytes) -> None:
     """Write raw bytes (e.g. a PNG) to a Hadoop/R2 path, overwriting if present."""
     jvm = spark.sparkContext._jvm
@@ -1108,15 +1260,6 @@ def _classify_higher_is_better(value: float, green: float, yellow: float) -> str
     if value >= yellow:
         return "YELLOW"
     return "RED"
-
-
-def _filter_latest_run(series: list[dict]) -> list[dict]:
-    """Keep only the latest model's points (series is sorted oldest-first), so the
-    AutoML line shows only the current challenger version."""
-    if not series:
-        return series
-    latest_run_id = series[-1].get("run_id")
-    return [point for point in series if point.get("run_id") == latest_run_id]
 
 
 def _safe_plot(spark, path: str, builder) -> None:
@@ -1158,10 +1301,10 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
     except Exception as exc:
         logger.warning("Performance metrics unavailable: %s", exc)
 
-    # PSI (predictions only → full batch)
+    # PSI (predictions only → full batch); baseline = predictions on the train set.
     try:
         psi_result = compute_psi(
-            load_baseline_prediction_counts(spark, t0["prediction_delta_path"]),
+            load_baseline_prediction_counts(spark, resolve_train_predictions_path(spark, paths, T0_EXP_ID)),
             load_production_prediction_counts(spark, paths, batch_id),
             labels,
         )
@@ -1171,10 +1314,10 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
     except Exception as exc:
         logger.warning("PSI unavailable: %s", exc)
 
-    # CSI (features only → full batch)
+    # CSI (features only → full batch); baseline = training DCW feature values.
     try:
         features = load_global_features(spark, paths, T0_EXP_ID)
-        baseline_values = load_csi_baseline_values(spark, paths, features)
+        baseline_values = load_csi_baseline_values(spark, paths, features, t0["feature_run_id"])
         production_values = load_csi_production_values(spark, paths, batch_id, features)
         csi_result = compute_csi(baseline_values, production_values, features)
         csi_values = {"features": features, "baseline": baseline_values, "production": production_values}
@@ -1191,11 +1334,12 @@ def run_monitoring(spark, batch_id: str) -> dict:
     """
     Daily entrypoint (runs right after batch inference). Computes performance / PSI /
     CSI for the production model on this batch, writes metrics.json, then rebuilds the
-    trend history (now including this batch) and renders the 5 dashboard PNGs — all
+    trend history (now including this batch) and renders the dashboard PNGs — all
     under monitoring/{batch_id}/ on R2.
 
-    AutoML is a placeholder: until AUTOML_EXP_ID is set, only production is monitored
-    and the AutoML trend lines stay empty.
+    If a shadow model is configured (SHADOW_MODEL_PATH), its performance is also
+    computed and appears as a second line on the performance plot; otherwise only
+    production is tracked.
     """
     schema = load_schema()
     paths = load_paths(schema)
@@ -1206,20 +1350,35 @@ def run_monitoring(spark, batch_id: str) -> dict:
     t0 = load_t0_baseline(spark, paths)
     production, psi_result, csi_result, csi_values = _monitor_production(spark, paths, batch_id, t0)
 
-    # TODO: when AUTOML_EXP_ID is set, monitor the challenger the same way and put it here.
+    # Optional shadow model: performance only (a second line on the performance plot).
+    shadow = None
+    try:
+        shadow_performance = load_shadow_performance(spark, paths, batch_id, t0["labels"])
+        if shadow_performance:
+            shadow = {
+                "run_id": "shadow",
+                "macro_f1": shadow_performance["macro_f1"],
+                "hamming_loss": shadow_performance["hamming_loss"],
+                "macro_f1_gyr": _classify_higher_is_better(shadow_performance["macro_f1"], MACRO_F1_GREEN, MACRO_F1_YELLOW),
+                "hamming_loss_gyr": _classify_lower_is_better(shadow_performance["hamming_loss"], HAMMING_GREEN, HAMMING_YELLOW),
+                "reviewed_count": shadow_performance["reviewed_count"],
+                "per_label_f1": shadow_performance["per_label_f1"],
+            }
+    except Exception as exc:
+        logger.warning("Shadow performance unavailable: %s", exc)
+
     report = {
         "batch_id": batch_id,
         "monitored_at": monitored_at,
         "production": production,
-        "automl": None,
+        "shadow": shadow,
     }
 
     # Persist first, so the history readback for the trend plots includes this batch.
     write_json(spark, f"{base_dir}/metrics.json", report, overwrite=True)
 
-    # Trend plots: production champion + latest AutoML challenger over time.
+    # Trend plots: production champion (+ shadow line if configured) over time.
     history = load_metric_history(spark, paths)
-    history["automl"] = _filter_latest_run(history["automl"])
     # T=0 baselines keyed by run_id (each model version anchors its own segment).
     # NOTE: only the current production model's baseline is loaded here; historical
     # promoted segments won't get a T=0 star until per-run_id baseline loading is added.
@@ -1241,6 +1400,16 @@ def run_monitoring(spark, batch_id: str) -> dict:
                    lambda: build_csi_distribution_plot(
                        csi_values["baseline"], csi_values["production"], csi_result,
                        csi_values["features"], batch_id, monitored_at, top_n=3))
+
+        # Per-feature CSI trends over time (this batch's per-feature CSI is now in
+        # history): one panel per feature, plus the top-3 overlaid for comparison.
+        feature_history = load_csi_feature_history(spark, paths)
+        if feature_history:
+            features = csi_values["features"]
+            _safe_plot(spark, f"{base_dir}/csi_feature_trends.png",
+                       lambda: build_csi_feature_grid_plot(feature_history, features, batch_id, monitored_at))
+            _safe_plot(spark, f"{base_dir}/csi_feature_trends_top3.png",
+                       lambda: build_csi_top_features_plot(feature_history, features, batch_id, monitored_at, top_n=3))
 
     logger.info("Monitoring complete for %s", batch_id)
     return report
