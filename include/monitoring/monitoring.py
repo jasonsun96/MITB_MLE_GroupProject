@@ -4,70 +4,75 @@ Batch-inference monitoring for the Legal Topic Tagger.
 ================================================================================
 ASSUMPTIONS & THINGS THAT PROBABLY NEED CHANGING
 ================================================================================
-This script stitches together tables/artifacts produced by other parts of the
-pipeline. Where those aren't built yet, I made assumptions — listed here with the
-function/constant to edit. Please sanity-check these against your work:
+UPSTREAM DATA CONTRACTS
 
-UPSTREAM DATA CONTRACTS (the script reads these; some don't exist yet):
-  • inference_features (gold) MUST carry a `dcw_features` map<string,double>
-    keyed by DCW *lemma* (e.g. "fighting"), next to document_id + the model
-    `features` vector. CSI's production side reads it. This table is currently
-    EMPTY on R2 and the assembly job isn't written — whoever builds it must add
-    that column.                                   → load_csi_production_values()
-  • published_predictions (gold) MUST be written by batch inference with columns
-    batch_id, document_id, predicted_labels (array<string>), deployment_group.
-    Performance / PSI / CSI all read it. Currently empty.
-  • Ground truth: the lawyer-reviewed 10% must be appended to label_store with
-    category='production'. Ingesting those reviewed labels is NOT done here.
-                                                   → REVIEWED_CATEGORY, load_ground_truth()
+• inference_features (gold) must contain:
+- document_id
+- dcw_features as MAP<STRING, DOUBLE>
+where keys are DCW lemmas. Used by CSI production monitoring. → load_csi_production_values()
 
-MODEL RESOLUTION (hardcoded, but need to be wired to correct path once done):
-  • T0_EXP_ID = "exp004_LR_tfidf_dcw_gs" is the assumed PRODUCTION model. Replace
-    with a lookup of the 'production' alias (include/inference/model_registry.py
-    get_alias) once monitoring should track whatever is actually promoted.
-  • SHADOW_MODEL_PATH = None disables the optional shadow model. To explore one,
-    hardcode the R2 path to its predictions table there; its performance then plots
-    as a second line on the performance dashboard.
+• published_predictions (gold) must contain:
+- batch_id
+- document_id
+- predicted_labels ARRAY
+Used by performance, PSI, and CSI monitoring. → load_batch_predictions()
+
+• Reviewed production labels must be appended to label_store with:
+category = 'production'
+Used for Macro F1 and Hamming Loss calculation. → REVIEWED_CATEGORY, load_ground_truth()
+
+MODEL RESOLUTION
+• T0_EXP_ID is currently hardcoded as the production model.
+
+• SHADOW_MODEL_PATH is optional and disabled by default.
+Set it to a predictions table to enable shadow-model comparison.→ SHADOW_MODEL_PATH
+
+MONITORING STORAGE
+• Historical trends are rebuilt by scanning: monitoring/*/metrics.json
 
 PATHS / SCHEMA (schema.yaml):
-  • Requires a top-level `monitoring:` entry (output path) — I added it; make sure
-    it's committed.                                            → load_paths()
-  • The feature-importance JSON path is NOT in schema.yaml; it's built in code as
-    model_bank/experiments/{exp_id}/model/feature_importance_*.json. Adjust if the
-    model_training layout differs.                       → load_global_features()
-  • Baselines come from the v2 gold layout (built in code, not schema tables):
-    CSI training features = gold/runs/{feature_run_id}/dcw_train; PSI training
-    predictions = gold/model_predictions/prediction_date=*/{exp_id}_train (latest).
-                  → load_csi_baseline_values(), resolve_train_predictions_path()
+  • Paths not in schema are hardcoded here (GOLD_RUNS_DIR, GOLD_MODEL_PREDICTIONS_DIR). 
 
 ================================================================================
  WHAT THIS CODE DOES
 ================================================================================
-Runs once per batch (right after batch inference) and writes, to
-monitoring/{batch_id}/ on R2, a metrics.json plus the dashboard PNGs:
 
-  performance.png               Macro F1 (P0) + Hamming Loss (P1) vs each model's T=0
-                                baseline, GYR-banded, as a time series.
-  stability.png                 PSI (label-distribution drift) + CSI (top-50 feature
-                                drift) time series, GYR-banded.
-  psi_distribution.png          Reference: per-label expected-vs-actual prevalence.
-  csi_distribution.png          Reference: per-feature baseline-vs-production value
-                                histograms for all 50 global features.
-  csi_distribution_top3.png     Same, for the 3 most globally-important features.
-  csi_feature_trends.png        Per-feature CSI over time, all 50 (grid).
-  csi_feature_trends_top3.png   Per-feature CSI over time, top 3 (overlaid).
+Runs once per batch (typically immediately after batch inference) and writes
+monitoring artifacts under:
 
-The production champion is tracked as a trend line; an optional shadow model adds a
-second line on the performance plot. Lines break at a model swap (promotion) so a
-change of model never looks like drift; each segment restarts at its own T=0.
+    monitoring/{batch_id}/
 
-Metric families:
-  • Performance (needs ground truth → reviewed 10% only): Macro F1, Hamming Loss.
-  • PSI (predictions only → full batch): predicted-label distribution vs OOT.
-  • CSI (features only → full batch): top-50 global feature values vs OOT.
+Artifacts produced:
 
-History for the trend lines is rebuilt each run by reading prior metrics.json
-files back from monitoring/ (load_metric_history); there is no central index.
+  metrics.json
+      Monitoring metrics for the current batch.
+
+  performance.png
+      Time-series plot of Macro F1 and Hamming Loss using reviewed
+      production documents only.
+
+  stability.png
+      Time-series plot of PSI (prediction drift) and CSI
+      (feature drift).
+
+  psi_distribution.png
+      Per-label expected-vs-actual predicted prevalence
+      comparison for the current batch.
+
+  csi_distribution.png
+      Baseline-vs-production feature distribution comparison
+      for all monitored CSI features.
+
+  csi_distribution_top3.png
+      Same as above but limited to the top 3 globally-important
+      monitored features.
+
+  csi_feature_trends.png
+      Historical CSI trend for every monitored feature.
+
+  csi_feature_trends_top3.png
+      Historical CSI trend for the top 3 globally-important
+      monitored features.
 '''
 from __future__ import annotations
 
