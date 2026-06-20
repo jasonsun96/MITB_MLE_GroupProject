@@ -26,10 +26,13 @@ def load_registry_paths(schema_path: Path = PROJECT_ROOT / "schema.yaml") -> dic
         model_bank = yaml.safe_load(schema_file)["model_bank"]
 
     base = model_bank["path"].rstrip("/")
+    runs_path = model_bank.get("runs", {}).get("path", "runs")
+    aliases_path = model_bank.get("aliases", {}).get("path", "aliases")
+    deployment_history_path = model_bank.get("deployment_history", {}).get("path", "deployment_history")
     return {
-        "runs": f"{base}/{model_bank['runs']['path']}",
-        "aliases": f"{base}/{model_bank['aliases']['path']}",
-        "deployment_history": f"{base}/{model_bank['deployment_history']['path']}",
+        "runs": f"{base}/{runs_path}",
+        "aliases": f"{base}/{aliases_path}",
+        "deployment_history": f"{base}/{deployment_history_path}",
     }
 
 

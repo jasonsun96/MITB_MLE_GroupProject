@@ -26,11 +26,17 @@ def load_paths() -> dict[str, str]:
 
     gold = schema["gold"]
     base = gold["path"].rstrip("/")
-    tables = gold["tables"]
+    tables = gold.get("tables") or {}
+    inference_features = (
+        tables.get("inference_features", {}).get("path")
+        or f"{gold['runs']['base']}/{gold['runs'].get('default_gold_run_id', gold['runs']['default_run_id'])}/{gold['runs']['X_unlabelled']}"
+    )
+    batch_inference = tables.get("batch_inference", {}).get("path") or "batch_inference"
+    published_predictions = tables.get("published_predictions", {}).get("path") or "published_predictions"
     return {
-        "input": f"{base}/{tables['inference_features']['path']}",
-        "output": f"{base}/{tables['batch_inference']['path']}",
-        "published_predictions": f"{base}/{tables['published_predictions']['path']}",
+        "input": f"{base}/{inference_features}",
+        "output": f"{base}/{batch_inference}",
+        "published_predictions": f"{base}/{published_predictions}",
     }
 
 
