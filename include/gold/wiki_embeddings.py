@@ -14,14 +14,15 @@ comparable downstream.
 wiki docs are short (median ~100 words), so most will produce just one chunk
 and run much faster than legal.
 """
+
 import argparse
 import logging
 from pathlib import Path
 
 import pyspark.sql.functions as F
 import yaml
-from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType, IntegerType
-
+from pyspark.sql.types import (ArrayType, FloatType, IntegerType, StringType,
+                               StructField, StructType)
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: Legal-BERT embeddings (wiki)")
@@ -177,28 +178,17 @@ def main():
     df = df.repartition(32)
 
     input_count = df.count()
-    logger.info(
-        f"Processing {input_count:,} wiki documents across "
-        f"{df.rdd.getNumPartitions()} partitions"
+    logger.info(f"Processing {input_count:,} wiki documents across " f"{df.rdd.getNumPartitions()} partitions")
+
+    result = df.withColumn("_emb", embed_udf(F.col("text"))).select(
+        F.col("document_id"),
+        F.col("labels"),
+        F.col("_emb.embedding").alias("embedding"),
+        F.col("_emb.embedding_model").alias("embedding_model"),
+        F.col("_emb.n_chunks").alias("n_chunks"),
     )
 
-    result = (
-        df.withColumn("_emb", embed_udf(F.col("text")))
-          .select(
-              F.col("document_id"),
-              F.col("labels"),
-              F.col("_emb.embedding").alias("embedding"),
-              F.col("_emb.embedding_model").alias("embedding_model"),
-              F.col("_emb.n_chunks").alias("n_chunks"),
-          )
-    )
-
-    (
-        result.write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .save(OUTPUT_PATH)
-    )
+    (result.write.format("delta").mode("overwrite").option("mergeSchema", "true").save(OUTPUT_PATH))
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

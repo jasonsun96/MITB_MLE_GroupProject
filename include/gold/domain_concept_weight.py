@@ -5,16 +5,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pyspark.sql.functions as F
-from pyspark.sql.types import ArrayType, DoubleType, IntegerType, LongType, MapType, StringType, StructField, StructType
+from pyspark.sql.types import (ArrayType, DoubleType, IntegerType, LongType,
+                               MapType, StringType, StructField, StructType)
+from utils.spark_session import create_spark_session
+
+from gold_io import load_pickle, save_pickle, write_delta
+from run_paths import (corpus_table_path, default_feature_run_id,
+                       resolve_feature_run_paths)
 
 _GOLD_DIR = Path(__file__).resolve().parent
 for _entry in (str(_GOLD_DIR.parents[1]), str(_GOLD_DIR)):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
-from gold_io import load_pickle, save_pickle, write_delta
-from run_paths import corpus_table_path, default_feature_run_id, resolve_feature_run_paths
-from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: domain concept weighting")
 parser.add_argument("--run-id", default=None, help="Feature run id (e.g. run001). Default: run_<UTC timestamp>.")
@@ -46,21 +49,30 @@ logger.info("Run ID: %s", RUN_ID)
 logger.info("DCW train output: %s", DCW_TRAIN_PATH)
 logger.info("DCW extractor: %s", DCW_PKL_PATH)
 
-POS_TAGS  = ["NOUN", "PROPN"]
-ALPHA     = 0.5
-BETA      = 0.5
+POS_TAGS = ["NOUN", "PROPN"]
+ALPHA = 0.5
+BETA = 0.5
 
 # schema for the lemma extraction UDF output
-_LEMMA_SCHEMA = ArrayType(StructType([
-    StructField("lemma", StringType()),
-    StructField("count", IntegerType()),
-]))
+_LEMMA_SCHEMA = ArrayType(
+    StructType(
+        [
+            StructField("lemma", StringType()),
+            StructField("count", IntegerType()),
+        ]
+    )
+)
 
 # schema for the DC contribution UDF output
-_DC_CONTRIB_SCHEMA = ArrayType(StructType([
-    StructField("lemma", StringType()),
-    StructField("contrib", DoubleType()),
-]))
+_DC_CONTRIB_SCHEMA = ArrayType(
+    StructType(
+        [
+            StructField("lemma", StringType()),
+            StructField("contrib", DoubleType()),
+        ]
+    )
+)
+
 
 def build_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids) -> dict:
     """In-memory frozen DCW artifact (same fields as dcw.pkl bundle, minus metadata)."""
@@ -133,7 +145,7 @@ def load_dcw_artifact():
 
 def load_split_labels():
     """Load gold/labels Delta table. Returns a Spark DataFrame with document_id and category columns.
-    category values: train / val / test / oot 
+    category values: train / val / test / oot
     """
     df = spark.read.format("delta").load(LABELS_PATH)
     logger.info(f"Split labels loaded: {df.count():,} rows")  # CHANGE IF OOT NOT USED
@@ -142,6 +154,7 @@ def load_split_labels():
 
 def add_n_nouns_propn(df, pos_tags=POS_TAGS):
     """Add n_nouns_propn: total NOUN+PROPN token count per document."""
+
     def count_nouns(pc):
         if not pc:
             return 0
@@ -157,26 +170,19 @@ def build_filtered_vocab(train_df, pos_tags=POS_TAGS, min_freq=50, min_len=1):
     Returns a plain Python dict {lemma: corpus_count} — frozen artefact for all splits.
     Collected to driver.
     """
+
     def extract_lemmas(pc):
         if not pc:
             return []
-        return [
-            (lemma, cnt)
-            for pos in pos_tags
-            for lemma, cnt in (pc.get(pos) or {}).items()
-        ]
+        return [(lemma, cnt) for pos in pos_tags for lemma, cnt in (pc.get(pos) or {}).items()]
 
     extract_udf = F.udf(extract_lemmas, _LEMMA_SCHEMA)
 
     rows = (
-        train_df
-        .withColumn("lc", F.explode(extract_udf(F.col("pos_counts"))))
+        train_df.withColumn("lc", F.explode(extract_udf(F.col("pos_counts"))))
         .groupBy(F.col("lc.lemma").alias("lemma"))
         .agg(F.sum("lc.count").alias("total_count"))
-        .filter(
-            (F.length(F.col("lemma")) > min_len) &
-            (F.col("total_count") > min_freq)
-        )
+        .filter((F.length(F.col("lemma")) > min_len) & (F.col("total_count") > min_freq))
         .collect()
     )
 
@@ -193,10 +199,7 @@ def compute_score(dp, dc, alpha=ALPHA, beta=BETA):
     max_dc = max(dc.values())
 
     common = dp.keys() & dc.keys()
-    return {
-        term: alpha * (dp[term] / max_dp) + beta * (dc[term] / max_dc)
-        for term in common
-    }
+    return {term: alpha * (dp[term] / max_dp) + beta * (dc[term] / max_dc) for term in common}
 
 
 def compute_dp(filtered_vocab, wiki_df, pos_tags=POS_TAGS):
@@ -211,29 +214,15 @@ def compute_dp(filtered_vocab, wiki_df, pos_tags=POS_TAGS):
         if not pc:
             return []
         vocab = vocab_bc.value
-        return [
-            (lemma, cnt)
-            for pos in pos_tags
-            for lemma, cnt in (pc.get(pos) or {}).items()
-            if lemma in vocab
-        ]
+        return [(lemma, cnt) for pos in pos_tags for lemma, cnt in (pc.get(pos) or {}).items() if lemma in vocab]
 
     extract_udf = F.udf(extract_lemmas_in_vocab, _LEMMA_SCHEMA)
 
-    wiki_counts = (
-        wiki_df
-        .withColumn("lc", F.explode(extract_udf(F.col("pos_counts"))))
-        .groupBy(F.col("lc.lemma").alias("lemma"))
-        .agg(F.sum("lc.count").alias("wiki_count"))
-        .collect()
-    )
+    wiki_counts = wiki_df.withColumn("lc", F.explode(extract_udf(F.col("pos_counts")))).groupBy(F.col("lc.lemma").alias("lemma")).agg(F.sum("lc.count").alias("wiki_count")).collect()
 
     wiki_count_dict = {row["lemma"]: row["wiki_count"] for row in wiki_counts}
 
-    return {
-        lemma: legal_count / max(wiki_count_dict.get(lemma, 0), 1)
-        for lemma, legal_count in filtered_vocab.items()
-    }
+    return {lemma: legal_count / max(wiki_count_dict.get(lemma, 0), 1) for lemma, legal_count in filtered_vocab.items()}
 
 
 def compute_dc(train_df, filtered_vocab, pos_tags=POS_TAGS):
@@ -263,8 +252,7 @@ def compute_dc(train_df, filtered_vocab, pos_tags=POS_TAGS):
     extract_udf = F.udf(extract_dc_contribs, _DC_CONTRIB_SCHEMA)
 
     rows = (
-        train_df
-        .withColumn("dc_contrib", F.explode(extract_udf(F.col("pos_counts"), F.col("n_nouns_propn"))))
+        train_df.withColumn("dc_contrib", F.explode(extract_udf(F.col("pos_counts"), F.col("n_nouns_propn"))))
         .groupBy(F.col("dc_contrib.lemma").alias("lemma"))
         .agg((-F.sum("dc_contrib.contrib")).alias("dc"))
         .collect()
@@ -281,12 +269,7 @@ def add_n_nouns_propn_filtered(df, filtered_vocab, pos_tags=POS_TAGS):
         if not pc:
             return 0
         vocab = vocab_bc.value
-        return sum(
-            cnt
-            for pos in pos_tags
-            for lemma, cnt in (pc.get(pos) or {}).items()
-            if lemma in vocab
-        )
+        return sum(cnt for pos in pos_tags for lemma, cnt in (pc.get(pos) or {}).items() if lemma in vocab)
 
     udf_fn = F.udf(count_filtered, LongType())
     return df.withColumn("n_nouns_propn_filtered", udf_fn(F.col("pos_counts")))
@@ -317,24 +300,24 @@ def add_dcw_columns(df, score, pos_tags=POS_TAGS):
 
 def main():
     legal = spark.read.format("delta").load(LEGAL_POS_PATH)
-    wiki  = spark.read.format("delta").load(WIKI_POS_PATH)
+    wiki = spark.read.format("delta").load(WIKI_POS_PATH)
 
     if args.limit:
         legal = legal.limit(args.limit)
-        wiki  = wiki.limit(args.limit)
+        wiki = wiki.limit(args.limit)
         logger.info(f"Smoke test mode: limited to {args.limit:,} rows")
 
     logger.info(f"Loaded legal: {legal.count():,} rows")
     logger.info(f"Loaded wiki : {wiki.count():,} rows")
 
-    if args.no_split: # REMOVE WHEN DONE
+    if args.no_split:  # REMOVE WHEN DONE
         logger.warning("--no-split: using all legal data as train, skipping val/test/oot. Smoke test only.")  # CHANGE IF OOT NOT USED
-        train        = legal
+        train = legal
         val_test_oot = None
     else:
         labels_sdf = load_split_labels().select("document_id", "category")
         legal = legal.join(labels_sdf, on="document_id", how="inner")
-        train        = legal.filter(F.col("category") == "train").drop("category")
+        train = legal.filter(F.col("category") == "train").drop("category")
         val_test_oot = legal.filter(F.col("category") != "train").drop("category")
         logger.info(f"Val/test/oot size: {val_test_oot.count():,} documents")
 
@@ -367,27 +350,15 @@ def main():
     train_dcw = add_dcw_columns(train, artifact["score"])
     logger.info(f"DCW features map column added to train (vocab size: {len(score):,} lemmas)")
 
-    (
-        train_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels")
-        .write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .save(DCW_TRAIN_PATH)
-    )
+    (train_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels").write.format("delta").mode("overwrite").option("mergeSchema", "true").save(DCW_TRAIN_PATH))
     output_count = spark.read.format("delta").load(DCW_TRAIN_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {DCW_TRAIN_PATH}")
 
-    if val_test_oot is not None: # REMOVE WHEN DONE
+    if val_test_oot is not None:  # REMOVE WHEN DONE
         val_test_oot = add_n_nouns_propn(val_test_oot)
         val_test_oot = add_n_nouns_propn_filtered(val_test_oot, artifact["filtered_vocab"])
         val_test_oot_dcw = add_dcw_columns(val_test_oot, artifact["score"])
-        (
-            val_test_oot_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels")
-            .write.format("delta")
-            .mode("overwrite")
-                .option("mergeSchema", "true")
-            .save(DCW_VAL_TEST_OOT_PATH)
-        )
+        (val_test_oot_dcw.drop("pos_counts", "n_unique_tokens", "n_total_tokens", "labels").write.format("delta").mode("overwrite").option("mergeSchema", "true").save(DCW_VAL_TEST_OOT_PATH))
         output_count_vto = spark.read.format("delta").load(DCW_VAL_TEST_OOT_PATH).count()
         logger.info(f"Wrote {output_count_vto:,} rows to {DCW_VAL_TEST_OOT_PATH}")
 
@@ -396,3 +367,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

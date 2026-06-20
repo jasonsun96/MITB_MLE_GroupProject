@@ -7,14 +7,15 @@ a different schema so a few column tweaks:
   - text column is `text` (legal uses act_raw_text)
   - no labels column, no snapshot_date, no partitionBy on write
 """
+
 import argparse
 import logging
 from pathlib import Path
 
 import pyspark.sql.functions as F
 import yaml
-from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
-
+from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
+                               StructType)
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts (wiki)")
@@ -48,7 +49,7 @@ SILVER_TABLES = SILVER["tables"]
 GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
 
-INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['wiki_docs_processed']['path']}"
+INPUT_PATH = f"{SILVER_PATH}/{SILVER_TABLES['wiki_docs_processed']['path']}"
 OUTPUT_PATH = f"{GOLD_PATH}/{GOLD['corpus']['pos_tags_wiki']['path']}"
 
 logger.info(f"Input  (silver): {INPUT_PATH}")
@@ -146,27 +147,16 @@ def main():
     df = df.repartition(200)
 
     input_count = df.count()
-    logger.info(
-        f"Processing {input_count:,} wiki documents across "
-        f"{df.rdd.getNumPartitions()} partitions"
+    logger.info(f"Processing {input_count:,} wiki documents across " f"{df.rdd.getNumPartitions()} partitions")
+
+    result = df.withColumn("_pos", extract_pos_counts_udf(F.col("text"))).select(
+        F.col("document_id"),
+        F.col("_pos.pos_counts").alias("pos_counts"),
+        F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
+        F.col("_pos.n_total_tokens").alias("n_total_tokens"),
     )
 
-    result = (
-        df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
-          .select(
-              F.col("document_id"),
-              F.col("_pos.pos_counts").alias("pos_counts"),
-              F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
-              F.col("_pos.n_total_tokens").alias("n_total_tokens"),
-          )
-    )
-
-    (
-        result.write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .save(OUTPUT_PATH)
-    )
+    (result.write.format("delta").mode("overwrite").option("mergeSchema", "true").save(OUTPUT_PATH))
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

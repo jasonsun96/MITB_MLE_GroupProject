@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import logging
 from collections import Counter
@@ -7,13 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from gold_io import PARTITION_COL, bootstrap_paths, write_delta
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from sklearn.preprocessing import MultiLabelBinarizer
-
 from utils.spark_session import create_spark_session
+
+from gold_io import PARTITION_COL, bootstrap_paths, write_delta
 
 bootstrap_paths()
 
@@ -23,6 +21,7 @@ LABEL_STORE_TABLE = "label_store"
 ID_COLUMN = "CELEX"
 LABEL_COLUMN = "labels"
 SPLIT_COLUMN = "category"
+INFERENCE_CATEGORY = "inference"
 DEFAULT_OOT_START_YEAR = 2004
 HOLDOUT_FRACTION_OF_PRE_OOT = 3 / 10
 TEST_FRACTION_OF_HOLDOUT = 1 / 3
@@ -40,16 +39,20 @@ def build_label_store(df):
     if missing_columns:
         raise ValueError(f"Required column(s) missing from silver input: {sorted(missing_columns)}")
 
+    labels_trimmed = F.trim(F.col("_raw_labels"))
     return (
         df.select(
             F.trim(F.col(ID_COLUMN)).alias("document_id"),
             F.col(PARTITION_COL),
-            F.trim(F.col(LABEL_COLUMN)).alias(LABEL_COLUMN),
+            F.col(LABEL_COLUMN).alias("_raw_labels"),
         )
+        .withColumn(
+            LABEL_COLUMN,
+            F.when(labels_trimmed.isNotNull() & (F.length(labels_trimmed) > 0), labels_trimmed).otherwise(F.lit(None).cast(T.StringType())),
+        )
+        .drop("_raw_labels")
         .filter(F.col("document_id").isNotNull())
         .filter(F.length(F.col("document_id")) > 0)
-        .filter(F.col(LABEL_COLUMN).isNotNull())
-        .filter(F.length(F.col(LABEL_COLUMN)) > 0)
     )
 
 
@@ -87,9 +90,7 @@ def split_pre_oot_documents(rows, random_seed: int):
         test_size=TEST_FRACTION_OF_HOLDOUT,
         random_state=random_seed + 1,
     )
-    validation_relative, test_relative = next(
-        validation_test_splitter.split(holdout_row_indexes, holdout_targets)
-    )
+    validation_relative, test_relative = next(validation_test_splitter.split(holdout_row_indexes, holdout_targets))
     validation_indexes = holdout_indexes[validation_relative]
     test_indexes = holdout_indexes[test_relative]
 
@@ -111,16 +112,22 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
         sample = [row.snapshot_date for row in invalid_dates]
         raise ValueError(f"Invalid snapshot_date values: {sample}")
 
-    pre_oot = label_store.filter(snapshot_year < oot_start_year)
-    oot = label_store.filter(snapshot_year >= oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
+    has_labels = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
+    labelled = label_store.filter(has_labels)
+    inference = label_store.filter(~has_labels).withColumn(SPLIT_COLUMN, F.lit(INFERENCE_CATEGORY))
+
+    if labelled.limit(1).count() == 0:
+        logger.info("No labelled documents found; assigning all rows to category=%s", INFERENCE_CATEGORY)
+        return inference
+
+    pre_oot = labelled.filter(snapshot_year < oot_start_year)
+    oot = labelled.filter(snapshot_year >= oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
 
     pre_oot_rows = pre_oot.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
     if not pre_oot_rows:
         raise ValueError("No pre-OOT documents available for train/validation/test splitting")
 
-    assignments, stratified_label_count = split_pre_oot_documents(
-        pre_oot_rows, random_seed=random_seed
-    )
+    assignments, stratified_label_count = split_pre_oot_documents(pre_oot_rows, random_seed=random_seed)
     assignment_schema = T.StructType(
         [
             T.StructField("document_id", T.StringType(), nullable=False),
@@ -135,7 +142,7 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
         f"{stratified_label_count:,}",
         f"{len(pre_oot_rows):,}",
     )
-    return train_validation_test.unionByName(oot)
+    return train_validation_test.unionByName(oot).unionByName(inference)
 
 
 def main() -> None:

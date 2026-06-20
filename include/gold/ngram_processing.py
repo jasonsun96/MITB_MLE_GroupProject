@@ -18,7 +18,6 @@ notes:
   - text capped at 500k chars at Spark level before tokenization
   - repartition by snapshot_date so partitionBy on write lines up with shuffle
 """
-from __future__ import annotations
 
 import argparse
 import logging
@@ -28,7 +27,8 @@ from pathlib import Path
 
 import yaml
 from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
+from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
+                               StructType)
 
 from gold_io import bootstrap_paths
 
@@ -207,8 +207,6 @@ def main():
     if PARTITION_COL in raw.columns:
         select_exprs.insert(2, F.col(PARTITION_COL).alias(PARTITION_COL))
 
-    label_filter_raw = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
-    label_filter_selected = F.col("labels").isNotNull() & (F.length(F.col("labels")) > 0)
     text_filter = F.col("_text").isNotNull() & (F.length(F.trim(F.col("_text"))) > MIN_TEXT_CHARS)
 
     if args.limit:
@@ -221,35 +219,16 @@ def main():
         if PARTITION_COL in raw.columns:
             id_exprs.append(F.col(PARTITION_COL).alias(PARTITION_COL))
 
-        doc_ids = [
-            row.document_id
-            for row in (
-                raw.select(*id_exprs)
-                .filter(label_filter_raw)
-                .dropDuplicates(["document_id"])
-                .limit(args.limit)
-                .collect()
-            )
-        ]
+        doc_ids = [row.document_id for row in (raw.select(*id_exprs).filter(F.col(ID_COLUMN).isNotNull()).dropDuplicates(["document_id"]).limit(args.limit).collect())]
         if not doc_ids:
             raise ValueError("No documents matched smoke-test filters")
 
         logger.info("Smoke test mode: loading text for %s documents", f"{len(doc_ids):,}")
 
-        df = (
-            raw.filter(F.col(ID_COLUMN).isin(doc_ids))
-            .select(*select_exprs)
-            .filter(text_filter)
-            .filter(label_filter_selected)
-        )
+        df = raw.filter(F.col(ID_COLUMN).isin(doc_ids)).select(*select_exprs).filter(text_filter)
         input_count = len(doc_ids)
     else:
-        df = (
-            raw.filter(label_filter_raw)
-            .select(*select_exprs)
-            .filter(text_filter)
-            .dropDuplicates(["document_id"])
-        )
+        df = raw.select(*select_exprs).filter(text_filter).dropDuplicates(["document_id"])
         if PARTITION_COL in df.columns:
             df = df.repartition(REPARTITION_N, PARTITION_COL)
         input_count = df.count()

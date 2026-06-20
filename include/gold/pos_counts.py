@@ -19,14 +19,15 @@ notes:
   - parser and ner disabled, we only need POS
   - text capped at 500k chars before tagging to keep python worker memory bounded
 """
+
 import argparse
 import logging
 from pathlib import Path
 
 import pyspark.sql.functions as F
 import yaml
-from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
-
+from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
+                               StructType)
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts")
@@ -60,10 +61,10 @@ SILVER_TABLES = SILVER["tables"]
 GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
 
-INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
+INPUT_PATH = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
 OUTPUT_PATH = f"{GOLD_PATH}/{GOLD['corpus']['pos_tags']['path']}"
 # silver passes through bronze's column names, so still act_raw_text not text
-TEXT_COL    = "act_raw_text"
+TEXT_COL = "act_raw_text"
 
 logger.info(f"Input  (silver): {INPUT_PATH}")
 logger.info(f"Output (gold)  : {OUTPUT_PATH}")
@@ -166,31 +167,19 @@ def main():
     df = df.repartition(200, "snapshot_date")
 
     input_count = df.count()
-    logger.info(
-        f"Processing {input_count:,} documents across "
-        f"{df.rdd.getNumPartitions()} partitions"
-    )
+    logger.info(f"Processing {input_count:,} documents across " f"{df.rdd.getNumPartitions()} partitions")
 
     # run the udf, then flatten the struct cols back to top-level
-    result = (
-        df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
-          .select(
-              F.col("document_id"),
-              F.col("labels"),
-              F.col("snapshot_date"),
-              F.col("_pos.pos_counts").alias("pos_counts"),
-              F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
-              F.col("_pos.n_total_tokens").alias("n_total_tokens"),
-          )
+    result = df.withColumn("_pos", extract_pos_counts_udf(F.col("text"))).select(
+        F.col("document_id"),
+        F.col("labels"),
+        F.col("snapshot_date"),
+        F.col("_pos.pos_counts").alias("pos_counts"),
+        F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
+        F.col("_pos.n_total_tokens").alias("n_total_tokens"),
     )
 
-    (
-        result.write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .partitionBy("snapshot_date")
-        .save(OUTPUT_PATH)
-    )
+    (result.write.format("delta").mode("overwrite").option("mergeSchema", "true").partitionBy("snapshot_date").save(OUTPUT_PATH))
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

@@ -3,7 +3,6 @@ import logging
 from pathlib import Path
 
 import yaml
-
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer processing pipeline")

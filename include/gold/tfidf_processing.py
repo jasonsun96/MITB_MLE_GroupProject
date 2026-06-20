@@ -18,29 +18,20 @@ notes:
   - val/test/oot never influence vocab selection or IDF
   - --no-split treats all ngram_count rows as train (smoke tests only)
 """
-from __future__ import annotations
 
 import argparse
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any
 
 from pyspark.ml.linalg import Vector, Vectors, VectorUDT
 from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
-
-from gold_io import (
-    PARTITION_COL,
-    bootstrap_paths,
-    columns_with_snapshot,
-    load_pickle,
-    save_json,
-    save_pickle,
-    write_delta,
-)
-from run_paths import default_feature_run_id, resolve_feature_run_paths
 from utils.spark_session import create_spark_session
+
+from gold_io import (PARTITION_COL, bootstrap_paths, columns_with_snapshot,
+                     load_pickle, save_json, save_pickle, write_delta)
+from run_paths import default_feature_run_id, resolve_feature_run_paths
 
 bootstrap_paths()
 
@@ -118,18 +109,9 @@ def join_ngrams_with_labels(ngrams, labels):
 
 
 def _build_vocab_from_train(train_df, max_features: int, min_doc_freq: int) -> tuple[list[str], dict[str, int]]:
-    doc_ngrams = (
-        train_df.select("document_id", F.explode(F.map_keys(F.col("ngram_counts"))).alias("ngram"))
-        .dropDuplicates(["document_id", "ngram"])
-    )
+    doc_ngrams = train_df.select("document_id", F.explode(F.map_keys(F.col("ngram_counts"))).alias("ngram")).dropDuplicates(["document_id", "ngram"])
 
-    vocab_df = (
-        doc_ngrams.groupBy("ngram")
-        .agg(F.countDistinct("document_id").alias("doc_freq"))
-        .filter(F.col("doc_freq") >= min_doc_freq)
-        .orderBy(F.desc("doc_freq"), "ngram")
-        .limit(max_features)
-    )
+    vocab_df = doc_ngrams.groupBy("ngram").agg(F.countDistinct("document_id").alias("doc_freq")).filter(F.col("doc_freq") >= min_doc_freq).orderBy(F.desc("doc_freq"), "ngram").limit(max_features)
 
     vocab = [row.ngram for row in vocab_df.collect()]
     ngram_to_idx = {ngram: idx for idx, ngram in enumerate(vocab)}
@@ -338,9 +320,7 @@ def select_tfidf_output(df):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Gold layer: freeze TF-IDF and log(tf)×(1+log(idf)) from ngram_count"
-    )
+    parser = argparse.ArgumentParser(description="Gold layer: freeze TF-IDF and log(tf)×(1+log(idf)) from ngram_count")
     parser.add_argument(
         "--run-id",
         default=None,
