@@ -648,7 +648,7 @@ def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
             point.update({metric: block.get(metric) for metric in TRACKED_METRICS})
             history[model].append(point)
 
-    # batch_id is a ts_nodash stamp; monitored_at is ISO. Either sorts chronologically.
+    # batch_id may be date-only or timestamp-style; monitored_at is ISO.
     for model in TRACKED_MODELS:
         history[model].sort(key=lambda point: point.get("monitored_at") or point.get("batch_id") or "")
         logger.info("Loaded %d prior %s point(s) from %s", len(history[model]), model, monitoring_base)
@@ -749,7 +749,7 @@ MODEL_STYLES = {
 
 
 def _point_time(point: dict) -> datetime | None:
-    """Parse a history point's timestamp for the x-axis (ISO, else ts_nodash batch_id)."""
+    """Parse a history point's timestamp for the x-axis (ISO, else batch_id)."""
     iso = point.get("monitored_at")
     if iso:
         try:
@@ -758,10 +758,12 @@ def _point_time(point: dict) -> datetime | None:
         except ValueError:
             pass
     batch_id = point.get("batch_id") or ""
-    try:
-        return datetime.strptime(batch_id, "%Y%m%dT%H%M%S")
-    except ValueError:
-        return None
+    for fmt in ("%Y%m%d", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(batch_id, fmt)
+        except ValueError:
+            pass
+    return None
 
 
 def _segments_by_run_id(series: list[dict]) -> list[list[dict]]:

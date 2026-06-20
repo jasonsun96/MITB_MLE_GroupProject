@@ -189,12 +189,16 @@ def main():
     # we'd never use more than ~2500 chars worth of text anyway
     MAX_TEXT_CHARS = 500_000
 
-    df = raw.select(
+    select_exprs = [
         F.col("CELEX").alias("document_id"),
         F.substring(F.col(TEXT_COL), 1, MAX_TEXT_CHARS).alias("text"),
         F.col("labels").alias("labels"),
         F.col("snapshot_date").alias("snapshot_date"),
-    ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
+    ]
+    if "batch_id" in raw.columns:
+        select_exprs.append(F.col("batch_id"))
+
+    df = raw.select(*select_exprs).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
         df = df.limit(args.limit)
@@ -212,6 +216,7 @@ def main():
         F.col("document_id"),
         F.col("labels"),
         F.col("snapshot_date"),
+        *([F.col("batch_id")] if "batch_id" in df.columns else []),
         F.col("_emb.embedding").alias("embedding"),
         F.col("_emb.embedding_model").alias("embedding_model"),
         F.col("_emb.n_chunks").alias("n_chunks"),

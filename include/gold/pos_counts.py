@@ -151,12 +151,16 @@ def main():
     # memory on outliers (some eurlex docs are 1.5M+ chars)
     MAX_TEXT_CHARS = 500_000
 
-    df = raw.select(
+    select_exprs = [
         F.col("CELEX").alias("document_id"),
         F.substring(F.col(TEXT_COL), 1, MAX_TEXT_CHARS).alias("text"),
         F.col("labels").alias("labels"),
         F.col("snapshot_date").alias("snapshot_date"),
-    ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
+    ]
+    if "batch_id" in raw.columns:
+        select_exprs.append(F.col("batch_id"))
+
+    df = raw.select(*select_exprs).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
         df = df.limit(args.limit)
@@ -174,6 +178,7 @@ def main():
         F.col("document_id"),
         F.col("labels"),
         F.col("snapshot_date"),
+        *([F.col("batch_id")] if "batch_id" in df.columns else []),
         F.col("_pos.pos_counts").alias("pos_counts"),
         F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
         F.col("_pos.n_total_tokens").alias("n_total_tokens"),

@@ -87,6 +87,8 @@ def rollback_batch(spark, batch_id: str) -> dict:
         manifest["input_path"],
         manifest.get("input_version"),
     )
+    if "batch_id" in source.columns:
+        source = source.filter(F.col("batch_id") == batch_id)
     rollback_input = source.join(candidate_ids, on="document_id", how="inner")
     production_run_id = manifest["production_run_id"]
     production_contract = validate_model_run(

@@ -28,7 +28,12 @@ with DAG(
     # ---- bronze ----
     bronze_ingest = DockerOperator(
         task_id="ingest_bronze",
-        command="python include/bronze/ingest_bronze.py --start-date {{ ds }} --end-date {{ ds }}",
+        command=(
+            "python include/bronze/ingest_bronze.py "
+            "--start-date {{ ds }} "
+            "--end-date {{ ds }} "
+            "--batch-id {{ ds_nodash }}"
+        ),
         **COMMON,
     )
 

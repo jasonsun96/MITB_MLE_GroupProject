@@ -367,6 +367,8 @@ def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | 
         manifest["input_path"],
         manifest.get("input_version"),
     )
+    if "batch_id" in source.columns:
+        source = source.filter(F.col("batch_id") == manifest["batch_id"])
     input_count = validate_input(source)
 
     assigned = assign_cohorts(source, manifest["canary_percentage"])

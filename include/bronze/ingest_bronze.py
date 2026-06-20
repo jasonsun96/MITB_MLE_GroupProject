@@ -87,7 +87,14 @@ def write_delta_table(df, output_path: str, partition_col: str | None = None, sn
     writer.mode("overwrite").save(output_path)
 
 
-def ingest_legal_docs(spark, landing: dict, bronze: dict, start_date: str, end_date: str) -> None:
+def ingest_legal_docs(
+    spark,
+    landing: dict,
+    bronze: dict,
+    start_date: str,
+    end_date: str,
+    batch_id: str | None = None,
+) -> None:
     dataset_config = landing["legal_docs"]
     table_config = {
         **bronze["tables"][LEGAL_DOCS_TABLE],
@@ -112,6 +119,8 @@ def ingest_legal_docs(spark, landing: dict, bronze: dict, start_date: str, end_d
                 raise ValueError(f"Detected merged CSV records in {source_file_path}; " f"affected CELEX sample: {sample_ids}")
 
             df = df.withColumn("snapshot_date", F.lit(snapshot_date))
+            if batch_id:
+                df = df.withColumn("batch_id", F.lit(batch_id))
             write_delta_table(
                 df,
                 output_path,
@@ -182,6 +191,11 @@ def main() -> None:
         default=None,
         help="Backfill end date (YYYY-MM-DD), overrides schema.yaml",
     )
+    parser.add_argument(
+        "--batch-id",
+        default=None,
+        help="Operational batch id to stamp on ingested legal documents.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -201,7 +215,7 @@ def main() -> None:
     logger.info("Bronze ingest started | %s to %s", start_date, end_date)
 
     spark = create_spark_session("ingest-bronze")
-    ingest_legal_docs(spark, landing, bronze, start_date, end_date)
+    ingest_legal_docs(spark, landing, bronze, start_date, end_date, args.batch_id)
     ingest_wiki_docs(spark, landing, bronze)
 
     logger.info("Bronze ingest complete")

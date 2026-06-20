@@ -46,7 +46,7 @@ with DAG(
         task_id="assemble_inference_features",
         command=(
             "python include/model_pipeline/assemble_inference_features.py "
-            "--batch-id {{ ts_nodash }} "
+            "--batch-id {{ ds_nodash }} "
             "--feature-run-id {{ params.feature_run_id }} "
             "--gold-run-id {{ params.gold_run_id }} "
             "--feature-set {{ params.feature_set }}"
@@ -59,7 +59,7 @@ with DAG(
         task_id="run_batch_inference",
         command=(
             "python include/inference/batch_inference.py "
-            "--batch-id {{ ts_nodash }} "
+            "--batch-id {{ ds_nodash }} "
             "--canary-percentage {{ params.canary_percentage }} "
             "{% if params.input_path %}"
             "--input-path '{{ params.input_path }}'"
@@ -71,12 +71,12 @@ with DAG(
         **COMMON,
     )
 
-    # Monitoring runs on the same batch (same ts_nodash batch-id) once predictions
+    # Monitoring runs on the same batch (same ds_nodash batch-id) once predictions
     # are published, computing performance / PSI / CSI and writing the dashboards to
     # monitoring/{batch_id}/ on R2.
     run_monitoring = DockerOperator(
         task_id="run_monitoring",
-        command="python include/monitoring/monitoring.py --batch-id {{ ts_nodash }}",
+        command="python include/monitoring/monitoring.py --batch-id {{ ds_nodash }}",
         execution_timeout=datetime.timedelta(hours=1),
         **COMMON,
     )

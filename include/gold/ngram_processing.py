@@ -206,6 +206,8 @@ def main():
     ]
     if PARTITION_COL in raw.columns:
         select_exprs.insert(2, F.col(PARTITION_COL).alias(PARTITION_COL))
+    if "batch_id" in raw.columns:
+        select_exprs.insert(3 if PARTITION_COL in raw.columns else 2, F.col("batch_id"))
 
     text_filter = F.col("_text").isNotNull() & (F.length(F.trim(F.col("_text"))) > MIN_TEXT_CHARS)
 
@@ -218,6 +220,8 @@ def main():
         ]
         if PARTITION_COL in raw.columns:
             id_exprs.append(F.col(PARTITION_COL).alias(PARTITION_COL))
+        if "batch_id" in raw.columns:
+            id_exprs.append(F.col("batch_id"))
 
         doc_ids = [row.document_id for row in (raw.select(*id_exprs).filter(F.col(ID_COLUMN).isNotNull()).dropDuplicates(["document_id"]).limit(args.limit).collect())]
         if not doc_ids:
@@ -248,6 +252,7 @@ def main():
             F.col("document_id"),
             F.col("labels"),
             *([F.col(PARTITION_COL)] if PARTITION_COL in df.columns else []),
+            *([F.col("batch_id")] if "batch_id" in df.columns else []),
             F.col("_ngrams.tokens").alias("tokens"),
             F.col("_ngrams.token_count").alias("token_count"),
             F.col("_ngrams.ngram_counts").alias("ngram_counts"),

@@ -40,12 +40,16 @@ def build_label_store(df):
         raise ValueError(f"Required column(s) missing from silver input: {sorted(missing_columns)}")
 
     labels_trimmed = F.trim(F.col("_raw_labels"))
+    select_exprs = [
+        F.trim(F.col(ID_COLUMN)).alias("document_id"),
+        F.col(PARTITION_COL),
+        F.col(LABEL_COLUMN).alias("_raw_labels"),
+    ]
+    if "batch_id" in df.columns:
+        select_exprs.append(F.col("batch_id"))
+
     return (
-        df.select(
-            F.trim(F.col(ID_COLUMN)).alias("document_id"),
-            F.col(PARTITION_COL),
-            F.col(LABEL_COLUMN).alias("_raw_labels"),
-        )
+        df.select(*select_exprs)
         .withColumn(
             LABEL_COLUMN,
             F.when(labels_trimmed.isNotNull() & (F.length(labels_trimmed) > 0), labels_trimmed).otherwise(F.lit(None).cast(T.StringType())),
