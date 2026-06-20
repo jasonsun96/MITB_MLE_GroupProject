@@ -101,32 +101,25 @@ def _load_inference_ids(
     spark,
     labels_path: str,
     category: str,
-    batch_id: str | None,
+    batch_id: str,
 ) -> DataFrame:
     labels = spark.read.format("delta").load(labels_path)
-    required = {DOCUMENT_ID_COL, SPLIT_COL}
+    required = {DOCUMENT_ID_COL, SPLIT_COL, "batch_id"}
     missing = required - set(labels.columns)
     if missing:
         raise ValueError(f"labels table missing required columns: {sorted(missing)}")
 
-    df = labels.filter(F.col(SPLIT_COL) == category)
-    if batch_id and "batch_id" in df.columns:
-        df = df.filter(F.col("batch_id") == batch_id)
+    df = labels.filter((F.col(SPLIT_COL) == category) & (F.col("batch_id") == batch_id))
 
     select_cols = [DOCUMENT_ID_COL, SPLIT_COL]
     if "snapshot_date" in df.columns:
         select_cols.append("snapshot_date")
-    if "batch_id" in df.columns:
-        select_cols.append("batch_id")
-    elif batch_id:
-        df = df.withColumn("batch_id", F.lit(batch_id))
-        select_cols.append("batch_id")
+    select_cols.append("batch_id")
 
     ids = df.select(*select_cols).dropDuplicates([DOCUMENT_ID_COL])
     count = ids.count()
     if count == 0:
-        batch_msg = f" and batch_id={batch_id!r}" if batch_id else ""
-        raise ValueError(f"No documents found with category={category!r}{batch_msg}")
+        raise ValueError(f"No documents found with category={category!r} and batch_id={batch_id!r}")
     logger.info("Loaded %s inference document ids", f"{count:,}")
     return ids
 
@@ -149,7 +142,7 @@ def assemble_inference_features(
     *,
     feature_set: str,
     category: str,
-    batch_id: str | None,
+    batch_id: str,
     limit: int | None,
 ) -> DataFrame:
     components = _feature_components(feature_set)
@@ -232,7 +225,7 @@ def main() -> None:
     parser.add_argument("--gold-run-id", default=DEFAULT_GOLD_RUN_ID)
     parser.add_argument("--feature-set", default=DEFAULT_FEATURE_SET)
     parser.add_argument("--category", default=DEFAULT_INFERENCE_CATEGORY)
-    parser.add_argument("--batch-id", default=None)
+    parser.add_argument("--batch-id", required=True)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     args = parser.parse_args()
