@@ -67,7 +67,7 @@ else:
 # silver passes through bronze's column names, so still act_raw_text for both
 TEXT_COL = "act_raw_text"
 
-OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['tables']['embeddings']['path']}"
+OUTPUT_PATH = f"{schema['gold']['path']}/{schema['gold']['corpus']['embeddings']['path']}"
 
 logger.info(f"Input  ({args.input_layer}): {INPUT_PATH}")
 logger.info(f"Output (gold)             : {OUTPUT_PATH}")

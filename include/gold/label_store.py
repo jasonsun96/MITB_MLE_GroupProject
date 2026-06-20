@@ -171,7 +171,7 @@ def main() -> None:
     silver = schema["silver"]
     gold = schema["gold"]
     input_path = f"{silver['path']}/{silver['tables'][LEGAL_SILVER_TABLE]['path']}"
-    output_path = f"{gold['path']}/{gold['tables'][LABEL_STORE_TABLE]['path']}"
+    output_path = f"{gold['path']}/{gold['corpus'][LABEL_STORE_TABLE]['path']}"
 
     logger.info("Input  (silver): %s", input_path)
     logger.info("Output (gold)  : %s", output_path)

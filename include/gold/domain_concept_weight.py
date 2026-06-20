@@ -1,16 +1,25 @@
 import argparse
 import logging
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyspark.sql.functions as F
-import yaml
 from pyspark.sql.types import ArrayType, DoubleType, IntegerType, LongType, MapType, StringType, StructField, StructType
 
+_GOLD_DIR = Path(__file__).resolve().parent
+for _entry in (str(_GOLD_DIR.parents[1]), str(_GOLD_DIR)):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+from gold_io import load_pickle, save_pickle, write_delta
+from run_paths import corpus_table_path, default_feature_run_id, resolve_feature_run_paths
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: domain concept weighting")
+parser.add_argument("--run-id", default=None, help="Feature run id (e.g. run001). Default: run_<UTC timestamp>.")
 parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-parser.add_argument("--no-split", action="store_true", help="Skip labels.pkl split — use all legal data as train. For smoke testing only.")
+parser.add_argument("--no-split", action="store_true", help="Skip labels split — use all legal data as train. For smoke testing only.")
 parser.add_argument("--limit", type=int, default=None, help="Limit to N rows for smoke testing. Omit for full corpus.")
 args = parser.parse_args()
 
@@ -21,26 +30,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-with open(Path(__file__).parent.parent.parent / "schema.yaml") as f:
-    schema = yaml.safe_load(f)
-
-GOLD = schema["gold"]
-GOLD_PATH = GOLD["path"]
-GOLD_TABLES = GOLD["tables"]
-
-LEGAL_POS_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts']['path']}"
-WIKI_POS_PATH         = f"{GOLD_PATH}/{GOLD_TABLES['pos_counts_wiki']['path']}"
-DCW_TRAIN_PATH        = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_train']['path']}"
-DCW_VAL_TEST_OOT_PATH = f"{GOLD_PATH}/{GOLD_TABLES['dcw_features_val_test_oot']['path']}" # CHANGE IF OOT NOT USED
-LABELS_PATH           = f"{GOLD_PATH}/{GOLD_TABLES['labels']['path']}"
-
-MODEL_BANK            = schema["model_bank"]
-MODEL_BANK_PATH       = MODEL_BANK["path"]
-MODEL_BANK_FE         = MODEL_BANK["features_extractor"]
-DCW_SCORE_PATH        = f"{MODEL_BANK_PATH}/{MODEL_BANK_FE['dcw_score']}"
-DCW_TRAIN_DOC_IDS_PATH = f"{MODEL_BANK_PATH}/{MODEL_BANK_FE['dcw_train_doc_ids']}"
+RUN_ID = args.run_id or default_feature_run_id()
+PATHS = resolve_feature_run_paths(RUN_ID)
+LEGAL_POS_PATH = corpus_table_path("pos_tags")
+WIKI_POS_PATH = corpus_table_path("pos_tags_wiki")
+DCW_TRAIN_PATH = PATHS["dcw_train"]
+DCW_VAL_TEST_OOT_PATH = PATHS["dcw_val_test_oot"]
+DCW_PKL_PATH = PATHS["dcw_pkl"]
+DCW_SCORE_PATH = PATHS["dcw_score_path"]
+DCW_TRAIN_DOC_IDS_PATH = PATHS["dcw_train_doc_ids_path"]
+LABELS_PATH = PATHS["labels"]
 
 spark = create_spark_session("domain-concept-weight")
+logger.info("Run ID: %s", RUN_ID)
+logger.info("DCW train output: %s", DCW_TRAIN_PATH)
+logger.info("DCW extractor: %s", DCW_PKL_PATH)
 
 POS_TAGS  = ["NOUN", "PROPN"]
 ALPHA     = 0.5
@@ -58,41 +62,73 @@ _DC_CONTRIB_SCHEMA = ArrayType(StructType([
     StructField("contrib", DoubleType()),
 ]))
 
+def build_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids) -> dict:
+    """In-memory frozen DCW artifact (same fields as dcw.pkl bundle, minus metadata)."""
+    return {
+        "filtered_vocab": filtered_vocab,
+        "dp": dp,
+        "dc": dc,
+        "score": score,
+        "train_document_ids": set(train_document_ids),
+    }
+
+
 def save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids):
-    """
-    Save the DCW scoring artefact as two Delta tables.
-    dcw_score: one row per lemma with corpus_count, dp, dc, score.
-    dcw_train_doc_ids: one row per train document_id.
-    """
+    """Save frozen DCW artefact to model_bank/runs/{run_id}/feature_extractors/dcw.pkl."""
+    bundle = {
+        "run_id": RUN_ID,
+        "filtered_vocab": filtered_vocab,
+        "dp": dp,
+        "dc": dc,
+        "score": score,
+        "train_document_ids": sorted(train_document_ids),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_pickle(DCW_PKL_PATH, bundle, spark)
+    logger.info("DCW extractor saved to %s", DCW_PKL_PATH)
+    _save_dcw_parquet_exports(filtered_vocab, dp, dc, score, train_document_ids)
+
+
+def _save_dcw_parquet_exports(filtered_vocab, dp, dc, score, train_document_ids):
+    """Delta/Parquet mirrors (monitoring / SQL) alongside dcw.pkl."""
     score_rows = [
-        {"lemma": lemma, "corpus_count": int(filtered_vocab[lemma]),
-         "dp": dp[lemma], "dc": dc[lemma], "score": score[lemma]}
+        {
+            "lemma": lemma,
+            "corpus_count": filtered_vocab.get(lemma),
+            "dp": dp.get(lemma),
+            "dc": dc.get(lemma),
+            "score": score.get(lemma),
+        }
         for lemma in score
     ]
-    spark.createDataFrame(score_rows) \
-        .write.format("delta").mode("overwrite").save(DCW_SCORE_PATH)
-    logger.info(f"DCW score table saved to {DCW_SCORE_PATH}")
+    score_df = spark.createDataFrame(score_rows)
+    write_delta(score_df, DCW_SCORE_PATH)
+    logger.info("Saved DCW score table to %s", DCW_SCORE_PATH)
 
-    spark.createDataFrame([{"document_id": d} for d in train_document_ids]) \
-        .write.format("delta").mode("overwrite").save(DCW_TRAIN_DOC_IDS_PATH)
-    logger.info(f"DCW train doc IDs saved to {DCW_TRAIN_DOC_IDS_PATH}")
+    train_ids_df = spark.createDataFrame(
+        [(doc_id,) for doc_id in sorted(train_document_ids)],
+        ["document_id"],
+    )
+    write_delta(train_ids_df, DCW_TRAIN_DOC_IDS_PATH)
+    logger.info("Saved DCW train document ids to %s", DCW_TRAIN_DOC_IDS_PATH)
 
 
 def load_dcw_artifact():
-    """Load the frozen DCW artifact from Delta tables. Returns a dict."""
-    rows = spark.read.format("delta").load(DCW_SCORE_PATH).collect()
-    filtered_vocab    = {r["lemma"]: r["corpus_count"] for r in rows}
-    dp                = {r["lemma"]: r["dp"]           for r in rows}
-    dc                = {r["lemma"]: r["dc"]           for r in rows}
-    score             = {r["lemma"]: r["score"]        for r in rows}
-
-    train_document_ids = {
-        r["document_id"]
-        for r in spark.read.format("delta").load(DCW_TRAIN_DOC_IDS_PATH).collect()
+    """Load the frozen DCW artifact from dcw.pkl. Returns a dict."""
+    bundle = load_pickle(DCW_PKL_PATH, spark)
+    train_document_ids = set(bundle["train_document_ids"])
+    logger.info(
+        "DCW artifact loaded: %s terms, %s train docs",
+        f"{len(bundle['score']):,}",
+        f"{len(train_document_ids):,}",
+    )
+    return {
+        "filtered_vocab": bundle["filtered_vocab"],
+        "dp": bundle["dp"],
+        "dc": bundle["dc"],
+        "score": bundle["score"],
+        "train_document_ids": train_document_ids,
     }
-    logger.info(f"DCW artifact loaded: {len(score):,} terms, {len(train_document_ids):,} train docs")
-    return {"filtered_vocab": filtered_vocab, "dp": dp, "dc": dc,
-            "score": score, "train_document_ids": train_document_ids}
 
 
 def load_split_labels():
@@ -325,11 +361,10 @@ def main():
     score = compute_score(dp, dc)
     logger.info(f"Domain score computed for {len(score):,} terms")
 
-    # ARTIFACT
+    artifact = build_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids)
     save_dcw_artifact(filtered_vocab, dp, dc, score, train_document_ids)
-  
 
-    train_dcw = add_dcw_columns(train, score)
+    train_dcw = add_dcw_columns(train, artifact["score"])
     logger.info(f"DCW features map column added to train (vocab size: {len(score):,} lemmas)")
 
     (
@@ -343,7 +378,6 @@ def main():
     logger.info(f"Wrote {output_count:,} rows to {DCW_TRAIN_PATH}")
 
     if val_test_oot is not None: # REMOVE WHEN DONE
-        artifact = load_dcw_artifact()
         val_test_oot = add_n_nouns_propn(val_test_oot)
         val_test_oot = add_n_nouns_propn_filtered(val_test_oot, artifact["filtered_vocab"])
         val_test_oot_dcw = add_dcw_columns(val_test_oot, artifact["score"])
