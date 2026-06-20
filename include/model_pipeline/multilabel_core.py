@@ -42,10 +42,8 @@ from run_paths import (
     model_bank_holdout_metrics_path,
     model_bank_model_manifest_json_path,
     model_bank_model_manifest_path,
-    model_bank_per_label_models_dir,
     model_bank_prediction_metrics_manifest_path,
     model_bank_threshold_sweep_path,
-    model_bank_run_root,
     normalize_prediction_suffix,
     prediction_batch_name,
     prediction_delta_path,
@@ -585,90 +583,10 @@ def resolve_model_manifest_path(
         if name.startswith(f"{model_name}_") and name.endswith(".pkl")
     )
     if not candidates:
-        # Legacy v1 layout: manifest lived under model/
-        legacy_dir = f"{model_bank_run_root(exp_id)}/model"
-        if legacy_dir != manifest_dir:
-            candidates = sorted(
-                name
-                for name in _list_hadoop_child_names(spark, legacy_dir)
-                if name.startswith(f"{model_name}_") and name.endswith(".pkl")
-            )
-            if candidates:
-                manifest_path = f"{legacy_dir}/{candidates[-1]}"
-                logger.info("Resolved legacy model manifest: %s", manifest_path)
-                return manifest_path
         raise FileNotFoundError(f"No model manifest found under {manifest_dir}")
     manifest_path = f"{manifest_dir}/{candidates[-1]}"
     logger.info("Resolved latest model manifest: %s", manifest_path)
     return manifest_path
-
-
-def _reconstruct_manifest_from_per_label_models(
-    spark,
-    exp_id: str,
-    paths: dict[str, str],
-    feature_set: str,
-    model_type: str = DEFAULT_MODEL_TYPE,
-) -> dict[str, Any]:
-    """Fallback when manifest .pkl on R2 is missing/corrupt; map per_label dirs to train labels."""
-    per_label_dir = model_bank_per_label_models_dir(exp_id)
-    dir_names = set(_list_hadoop_child_names(spark, per_label_dir))
-    if not dir_names:
-        raise FileNotFoundError(f"No per-label models found under {per_label_dir}")
-
-    labels_raw = _read_delta(spark, paths["labels"], "labels")
-    if SOURCE_LABEL_COL in labels_raw.columns:
-        source_col = SOURCE_LABEL_COL
-    elif SOURCE_LABEL_FALLBACK_COL in labels_raw.columns:
-        source_col = SOURCE_LABEL_FALLBACK_COL
-    else:
-        raise ValueError("labels table missing label column for manifest reconstruction")
-
-    train_labels = (
-        labels_raw.filter(F.col(SPLIT_COL) == "train")
-        .select(DOCUMENT_ID_COL, F.col(source_col).alias("_raw_target"))
-        .dropDuplicates([DOCUMENT_ID_COL])
-        .transform(lambda df: normalize_target_labels(df, "_raw_target"))
-    )
-    candidate_labels = [
-        row.lbl
-        for row in (
-            train_labels.select(F.explode(F.col(TARGET_LABELS_COL)).alias("lbl"))
-            .groupBy("lbl")
-            .count()
-            .orderBy(F.desc("count"), "lbl")
-            .collect()
-        )
-    ]
-
-    per_label_paths: dict[str, str] = {}
-    unmatched_dirs = set(dir_names)
-    for label in candidate_labels:
-        safe = _safe_label_name(label)
-        if safe in dir_names:
-            per_label_paths[label] = f"{per_label_dir}/{safe}"
-            unmatched_dirs.discard(safe)
-
-    if unmatched_dirs:
-        logger.warning("Unmatched per_label model dirs: %s", sorted(unmatched_dirs))
-    if not per_label_paths:
-        raise ValueError(
-            f"Could not map any train labels to model dirs under {per_label_dir}"
-        )
-
-    logger.info(
-        "Reconstructed manifest from %s per-label models (%s train labels matched)",
-        f"{len(per_label_paths):,}",
-        f"{len(candidate_labels):,}",
-    )
-    return {
-        "feature_set": feature_set,
-        "model_type": model_type,
-        "per_label_model_paths": per_label_paths,
-        "multilabel_threshold": 0.5,
-        "hyperparameters": _default_hyperparameters(model_type),
-        "reconstructed_from_per_label": True,
-    }
 
 
 def load_training_manifest(
@@ -679,38 +597,10 @@ def load_training_manifest(
     feature_set: str = "tfidf_dcw_embeddings",
     model_type: str = DEFAULT_MODEL_TYPE,
 ) -> tuple[dict[str, Any], str]:
-    model_name = model_type or load_schema()["model_bank"]["experiments"].get(
-        "default_model_name", DEFAULT_MODEL_TYPE
-    )
-    try:
-        manifest_path = resolve_model_manifest_path(spark, exp_id, model_date, model_type=model_type)
-    except FileNotFoundError:
-        per_label_dir = model_bank_per_label_models_dir(exp_id)
-        if paths is None or not _list_hadoop_child_names(spark, per_label_dir):
-            raise
-        manifest_path = model_bank_model_manifest_path(exp_id, model_name, model_date)
-        logger.warning("No manifest pickle under model dir; reconstructing from %s", per_label_dir)
-        return (
-            _reconstruct_manifest_from_per_label_models(
-                spark, exp_id, paths, feature_set, model_type=model_type
-            ),
-            manifest_path,
-        )
-
+    manifest_path = resolve_model_manifest_path(spark, exp_id, model_date, model_type=model_type)
     logger.info("Loading training manifest from %s", manifest_path)
-    try:
-        manifest = load_pickle(manifest_path, spark)
-        return manifest, manifest_path
-    except Exception as exc:
-        logger.warning("Failed to load manifest pickle (%s); using per_label fallback", exc)
-        if paths is None:
-            raise
-        return (
-            _reconstruct_manifest_from_per_label_models(
-                spark, exp_id, paths, feature_set, model_type=model_type
-            ),
-            manifest_path,
-        )
+    manifest = load_pickle(manifest_path, spark)
+    return manifest, manifest_path
 
 
 def _read_spark_ml_class_name(spark, model_path: str) -> str | None:
