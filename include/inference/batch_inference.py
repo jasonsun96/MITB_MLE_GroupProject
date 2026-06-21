@@ -6,6 +6,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from include.inference.model_registry import (hadoop_path_exists, read_json,
                                               write_json)
@@ -43,7 +44,7 @@ def load_feature_config(config_path: str | Path | None) -> dict:
     return config
 
 
-def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict[str, str]:
+def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict[str, Any]:
     import yaml
 
     with (PROJECT_ROOT / "schema.yaml").open() as schema_file:
@@ -58,6 +59,9 @@ def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_P
         raise ValueError("Feature config field 'features' must be a mapping")
 
     configured_input = feature_paths.get("input_path")
+    configured_inputs = feature_paths.get("input_paths") or {}
+    if configured_inputs and not isinstance(configured_inputs, dict):
+        raise ValueError("Feature config field 'features.input_paths' must be a mapping")
     configured_gold_run_id = feature_paths.get("gold_run_id")
     default_gold_run_id = gold["runs"].get("default_gold_run_id", gold["runs"]["default_run_id"])
     gold_run_id = str(configured_gold_run_id or default_gold_run_id).strip()
@@ -66,6 +70,12 @@ def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_P
     published_predictions = tables.get("published_predictions", {}).get("path") or "published_predictions"
     return {
         "input": _join_storage_path(base, str(inference_features)),
+        "input_configured": bool(configured_input or tables.get("inference_features", {}).get("path")),
+        "feature_input_paths": {
+            key: _join_storage_path(base, str(value))
+            for key, value in configured_inputs.items()
+            if value
+        },
         "output": _join_storage_path(base, str(batch_inference)),
         "published_predictions": _join_storage_path(base, str(published_predictions)),
     }
@@ -89,7 +99,7 @@ def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
     if not isinstance(entry, dict):
         raise ValueError(f"Feature config field 'deployment.{name}' must be a mapping")
 
-    if name == "candidate" and entry.get("enabled") is False:
+    if name == "shadow" and entry.get("enabled") is False:
         return None
 
     run_id = _clean_optional(entry.get("run_id")) or _clean_optional(entry.get("exp_id"))
@@ -117,25 +127,13 @@ def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
 def load_deployment_aliases(feature_config_path: str | Path | None) -> tuple[dict, dict | None]:
     config = load_feature_config(feature_config_path)
     production = _deployment_alias_from_config(config, "production")
-    candidate = _deployment_alias_from_config(config, "candidate")
+    shadow = _deployment_alias_from_config(config, "shadow")
     if not production:
         raise ValueError("Feature config must define deployment.production.run_id")
     logger.info("Using Git-configured production model run: %s", production["run_id"])
-    if candidate:
-        logger.info("Using Git-configured candidate model run: %s", candidate["run_id"])
-    return production, candidate
-
-
-def canary_document_count(total_documents: int, canary_percentage: float) -> int:
-    if not 0 <= canary_percentage < 100:
-        raise ValueError("canary_percentage must be between 0 and 100")
-    if canary_percentage == 0:
-        return 0
-    if total_documents < 2:
-        raise ValueError("Batch canary inference requires at least two documents")
-
-    requested = round(total_documents * canary_percentage / 100)
-    return min(max(requested, 1), total_documents - 1)
+    if shadow:
+        logger.info("Using Git-configured shadow model run: %s", shadow["run_id"])
+    return production, shadow
 
 
 def get_delta_version(spark, path: str) -> int:
@@ -153,59 +151,80 @@ def read_delta_version(spark, path: str, version: int | None = None):
     return reader.load(path)
 
 
-def load_or_create_manifest(spark, batch_id: str, canary_percentage: float, input_path: str | None, feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict:
+def _default_feature_input_path(paths: dict[str, str], batch_id: str, group: str) -> str:
+    return f"{paths['output']}/{batch_id}/features/{group}"
+
+
+def _resolve_feature_input_paths(
+    paths: dict[str, str],
+    batch_id: str,
+    input_path: str | None,
+    use_shadow: bool,
+) -> dict[str, str]:
+    configured = paths.get("feature_input_paths") or {}
+    configured_production_input = paths["input"] if paths.get("input_configured") else None
+    resolved = {
+        "production": input_path or configured.get("production") or configured_production_input or _default_feature_input_path(paths, batch_id, "production"),
+    }
+    # When no legacy/custom input is set, default production to the deployment-specific
+    # table emitted by assemble_inference_features.py.
+    if not input_path and not configured.get("production") and not configured_production_input:
+        resolved["production"] = _default_feature_input_path(paths, batch_id, "production")
+    if use_shadow:
+        if input_path and not configured.get("shadow"):
+            raise ValueError("Shadow deployment requires features.input_paths.shadow when --input-path overrides production features")
+        resolved["shadow"] = configured.get("shadow") or _default_feature_input_path(paths, batch_id, "shadow")
+    return resolved
+
+
+def load_or_create_manifest(
+    spark,
+    batch_id: str,
+    input_path: str | None,
+    feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH,
+) -> dict:
     paths = load_paths(feature_config_path)
     manifest_path = f"{paths['output']}/{batch_id}/manifest.json"
     if hadoop_path_exists(spark, manifest_path):
         logger.info("Reusing manifest at %s", manifest_path)
         return read_json(spark, manifest_path)
 
-    production, candidate = load_deployment_aliases(feature_config_path)
-    if not 0 <= canary_percentage < 100:
-        raise ValueError("canary_percentage must be between 0 and 100")
+    production, shadow = load_deployment_aliases(feature_config_path)
+    shadow_run_id = shadow["run_id"] if shadow else None
+    use_shadow = shadow_run_id is not None and shadow_run_id != production["run_id"]
+    if shadow_run_id and not use_shadow:
+        logger.info("Shadow model matches production; scoring production only")
 
-    candidate_run_id = candidate["run_id"] if candidate else None
-    use_canary = canary_percentage > 0 and candidate_run_id is not None and candidate_run_id != production["run_id"]
-    if canary_percentage > 0 and not use_canary:
-        logger.info("No distinct candidate model is set; using production for the full batch")
-
-    resolved_input_path = input_path or paths["input"]
+    feature_input_paths = _resolve_feature_input_paths(paths, batch_id, input_path, use_shadow)
+    input_versions = {
+        group: get_delta_version(spark, path)
+        for group, path in feature_input_paths.items()
+    }
+    resolved_input_path = feature_input_paths["production"]
     manifest = {
         "batch_id": batch_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "input_path": resolved_input_path,
-        "input_version": get_delta_version(spark, resolved_input_path),
+        "input_version": input_versions["production"],
+        "feature_input_paths": feature_input_paths,
+        "input_versions": input_versions,
         "predictions_path": f"{paths['output']}/{batch_id}/predictions",
         "validation_path": f"{paths['output']}/{batch_id}/validation.json",
         "published_predictions_path": paths["published_predictions"],
         "production_run_id": production["run_id"],
-        "candidate_run_id": candidate_run_id if use_canary else None,
-        "canary_percentage": canary_percentage if use_canary else 0,
+        "shadow_run_id": shadow_run_id if use_shadow else None,
         "deployment_source": production["source"],
         "production_model_config": production,
-        "candidate_model_config": candidate if use_canary else None,
+        "shadow_model_config": shadow if use_shadow else None,
     }
     write_json(spark, manifest_path, manifest, overwrite=False)
     return manifest
 
 
-def assign_cohorts(df, canary_percentage: float):
+def assign_deployment_group(df, group: str):
     from pyspark.sql import functions as F
-    from pyspark.sql.window import Window
 
-    candidate_count = canary_document_count(df.count(), canary_percentage)
-    if candidate_count == 0:
-        return df.withColumn("deployment_group", F.lit("production"))
-
-    stable_order = Window.orderBy(F.xxhash64("document_id"), F.col("document_id"))
-    return (
-        df.withColumn("_canary_rank", F.row_number().over(stable_order))
-        .withColumn(
-            "deployment_group",
-            F.when(F.col("_canary_rank") <= candidate_count, "candidate").otherwise("production"),
-        )
-        .drop("_canary_rank")
-    )
+    return df.withColumn("deployment_group", F.lit(group))
 
 
 def validate_input(df) -> int:
@@ -223,6 +242,41 @@ def validate_input(df) -> int:
     if df.select("document_id").distinct().count() != input_count:
         raise ValueError("Inference input contains duplicate document_id values")
     return input_count
+
+
+def load_group_input(spark, manifest: dict, group: str):
+    from pyspark.sql import functions as F
+
+    feature_input_paths = manifest.get("feature_input_paths") or {"production": manifest["input_path"]}
+    input_versions = manifest.get("input_versions") or {"production": manifest.get("input_version")}
+    if group not in feature_input_paths:
+        raise ValueError(f"Batch manifest missing feature input path for {group}")
+    source = read_delta_version(
+        spark,
+        feature_input_paths[group],
+        input_versions.get(group),
+    )
+    if "batch_id" in source.columns:
+        source = source.filter(F.col("batch_id") == manifest["batch_id"])
+    return source
+
+
+def validate_feature_run(source, contract: dict, group: str) -> None:
+    from pyspark.sql import functions as F
+
+    expected_feature_run_id = contract.get("feature_run_id")
+    if expected_feature_run_id and "feature_run_id" in source.columns:
+        unexpected_feature_runs = (
+            source
+            .select("feature_run_id")
+            .distinct()
+            .filter(F.col("feature_run_id").isNull() | (F.col("feature_run_id") != expected_feature_run_id))
+        )
+        if unexpected_feature_runs.limit(1).count():
+            raise ValueError(
+                f"{group} inference input was assembled with a different feature_run_id "
+                f"than the model expects: {expected_feature_run_id!r}"
+            )
 
 
 def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
@@ -279,23 +333,16 @@ def validate_model_contracts(spark, manifest: dict) -> dict:
             manifest.get("production_model_config"),
         )
     }
-    if manifest.get("candidate_run_id"):
-        contracts["candidate"] = validate_model_run(
+    if manifest.get("shadow_run_id"):
+        contracts["shadow"] = validate_model_run(
             spark,
-            manifest["candidate_run_id"],
-            manifest.get("candidate_model_config"),
+            manifest["shadow_run_id"],
+            manifest.get("shadow_model_config"),
         )
-        production_features = contracts["production"]["feature_set"]
-        candidate_features = contracts["candidate"]["feature_set"]
-        if candidate_features != production_features:
-            raise ValueError("Production and candidate models require different feature sets: " f"{production_features!r} != {candidate_features!r}")
-        production_feature_run = contracts["production"].get("feature_run_id")
-        candidate_feature_run = contracts["candidate"].get("feature_run_id")
-        if production_feature_run and candidate_feature_run and candidate_feature_run != production_feature_run:
-            raise ValueError(
-                "Production and candidate models require different feature runs: "
-                f"{production_feature_run!r} != {candidate_feature_run!r}"
-            )
+        production_labels = set(contracts["production"]["labels"])
+        shadow_labels = set(contracts["shadow"]["labels"])
+        if shadow_labels != production_labels:
+            raise ValueError("Production and shadow models require the same label set")
     return contracts
 
 
@@ -374,7 +421,8 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
 
     prediction_count = predictions.count()
     unique_count = predictions.select("document_id").distinct().count()
-    if prediction_count != input_count or unique_count != input_count:
+    expected_prediction_count = input_count * (2 if manifest.get("shadow_run_id") else 1)
+    if prediction_count != expected_prediction_count or unique_count != input_count:
         raise ValueError(f"Prediction coverage failed: input={input_count}, rows={prediction_count}, " f"unique_documents={unique_count}")
     if source.select("document_id").join(predictions.select("document_id"), "document_id", "left_anti").limit(1).count():
         raise ValueError("One or more input documents are missing predictions")
@@ -383,7 +431,7 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
 
     expected_runs = {
         "production": manifest["production_run_id"],
-        "candidate": manifest["candidate_run_id"],
+        "shadow": manifest.get("shadow_run_id"),
     }
     counts = {}
     for group, run_id in expected_runs.items():
@@ -403,11 +451,11 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
     if predictions.filter(~F.col("deployment_group").isin([group for group, run_id in expected_runs.items() if run_id])).limit(1).count():
         raise ValueError("Prediction output contains an unexpected deployment_group")
 
-    expected_candidate = canary_document_count(input_count, manifest["canary_percentage"])
-    if counts["candidate"] != expected_candidate:
-        raise ValueError(f"Candidate count mismatch: expected={expected_candidate}, " f"actual={counts['candidate']}")
-    if counts["production"] != input_count - expected_candidate:
-        raise ValueError("Production count does not match the expected cohort size")
+    if counts["production"] != input_count:
+        raise ValueError("Production count does not match the input size")
+    expected_shadow = input_count if manifest.get("shadow_run_id") else 0
+    if counts["shadow"] != expected_shadow:
+        raise ValueError(f"Shadow count mismatch: expected={expected_shadow}, actual={counts['shadow']}")
 
     return {
         "batch_id": manifest["batch_id"],
@@ -415,16 +463,19 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
         "input_count": input_count,
         "prediction_count": prediction_count,
         "production_count": counts["production"],
-        "candidate_count": counts["candidate"],
+        "shadow_count": counts["shadow"],
         "validated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def publish_predictions(spark, predictions, published_path: str) -> None:
     from delta.tables import DeltaTable
+    from pyspark.sql import functions as F
+
+    production_predictions = predictions.filter(F.col("deployment_group") == "production")
 
     if not DeltaTable.isDeltaTable(spark, published_path):
-        (predictions.write.format("delta").mode("errorifexists").partitionBy("batch_id").save(published_path))
+        (production_predictions.write.format("delta").mode("errorifexists").partitionBy("batch_id").save(published_path))
         logger.info("Created published predictions table at %s", published_path)
         return
 
@@ -432,7 +483,7 @@ def publish_predictions(spark, predictions, published_path: str) -> None:
     (
         target.alias("target")
         .merge(
-            predictions.alias("source"),
+            production_predictions.alias("source"),
             "target.batch_id = source.batch_id " "AND target.document_id = source.document_id",
         )
         .whenMatchedUpdateAll()
@@ -442,48 +493,48 @@ def publish_predictions(spark, predictions, published_path: str) -> None:
     logger.info("Merged batch predictions into %s", published_path)
 
 
-def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | None = None, feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> str:
+def run_batch(
+    spark,
+    batch_id: str,
+    input_path: str | None = None,
+    feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH,
+) -> str:
     from pyspark.sql import functions as F
 
-    manifest = load_or_create_manifest(spark, batch_id, canary_percentage, input_path, feature_config_path)
+    manifest = load_or_create_manifest(spark, batch_id, input_path, feature_config_path)
     contracts = validate_model_contracts(spark, manifest)
 
-    if "input_version" not in manifest:
+    if "feature_input_paths" not in manifest and "input_version" not in manifest:
         logger.warning(
             "Manifest for batch %s has no input_version; reading the latest Delta version",
             batch_id,
         )
-    source = read_delta_version(
-        spark,
-        manifest["input_path"],
-        manifest.get("input_version"),
-    )
-    if "batch_id" in source.columns:
-        source = source.filter(F.col("batch_id") == manifest["batch_id"])
-    input_count = validate_input(source)
-    expected_feature_run_id = contracts["production"].get("feature_run_id")
-    if expected_feature_run_id and "feature_run_id" in source.columns:
-        unexpected_feature_runs = (
-            source
-            .select("feature_run_id")
-            .distinct()
-            .filter(F.col("feature_run_id").isNull() | (F.col("feature_run_id") != expected_feature_run_id))
-        )
-        if unexpected_feature_runs.limit(1).count():
-            raise ValueError(
-                "Inference input was assembled with a different feature_run_id "
-                f"than the production model expects: {expected_feature_run_id!r}"
-            )
-
-    assigned = assign_cohorts(source, manifest["canary_percentage"])
     groups = [("production", manifest["production_run_id"])]
-    if manifest["candidate_run_id"]:
-        groups.append(("candidate", manifest["candidate_run_id"]))
+    if manifest.get("shadow_run_id"):
+        groups.append(("shadow", manifest["shadow_run_id"]))
+
+    sources = {}
+    counts = {}
+    for group, _ in groups:
+        source = load_group_input(spark, manifest, group)
+        counts[group] = validate_input(source)
+        validate_feature_run(source, contracts[group], group)
+        sources[group] = source
+
+    input_count = counts["production"]
+    production_ids = sources["production"].select("document_id")
+    for group, _ in groups[1:]:
+        if counts[group] != input_count:
+            raise ValueError(f"{group} feature input row count does not match production")
+        if production_ids.join(sources[group].select("document_id"), "document_id", "left_anti").limit(1).count():
+            raise ValueError(f"{group} feature input is missing production document IDs")
+        if sources[group].select("document_id").join(production_ids, "document_id", "left_anti").limit(1).count():
+            raise ValueError(f"{group} feature input contains documents absent from production")
 
     outputs = []
     allowed_labels = {}
     for group, run_id in groups:
-        cohort = assigned.filter(F.col("deployment_group") == group)
+        cohort = assign_deployment_group(sources[group], group)
         scored = score_cohort(cohort, contracts[group])
         allowed_labels[group] = set(contracts[group]["labels"])
         outputs.append(
@@ -502,7 +553,7 @@ def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | 
         predictions = predictions.unionByName(output)
 
     validation = validate_predictions(
-        source,
+        sources["production"],
         predictions,
         manifest,
         input_count,
@@ -526,10 +577,9 @@ def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run batch canary inference")
+    parser = argparse.ArgumentParser(description="Run batch shadow inference")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--batch-id", required=True)
-    parser.add_argument("--canary-percentage", type=float, default=10.0)
     parser.add_argument("--feature-config", default=str(DEFAULT_FEATURE_CONFIG_PATH))
     parser.add_argument("--input-path")
     args = parser.parse_args()
@@ -542,12 +592,11 @@ def main() -> None:
 
     from utils.spark_session import create_spark_session
 
-    spark = create_spark_session("batch-canary-inference")
+    spark = create_spark_session("batch-shadow-inference")
     try:
         published_path = run_batch(
             spark,
             args.batch_id,
-            args.canary_percentage,
             args.input_path,
             args.feature_config,
         )

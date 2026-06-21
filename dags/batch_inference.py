@@ -35,7 +35,6 @@ with DAG(
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
     params={
-        "canary_percentage": 5.0,
         "feature_config": "config/batch_inference.yaml",
         "input_path": "",
     },
@@ -60,7 +59,6 @@ with DAG(
         command=(
             "python include/inference/batch_inference.py "
             "--batch-id {{ ds_nodash }} "
-            "--canary-percentage {{ params.canary_percentage }} "
             "--feature-config {{ params.feature_config }} "
             "{% if params.input_path %}"
             "--input-path '{{ params.input_path }}'"
@@ -70,9 +68,9 @@ with DAG(
         **COMMON,
     )
 
-    # Monitoring runs on the same batch (same ds_nodash batch-id) once predictions
-    # are published, computing performance / PSI / CSI and writing the dashboards to
-    # monitoring/{batch_id}/ on R2.
+    # Monitoring runs on the same batch once production predictions are published.
+    # If shadow predictions were staged, monitoring adds shadow performance to the
+    # dashboard without publishing shadow outputs.
     run_monitoring = DockerOperator(
         task_id="run_monitoring",
         command=(

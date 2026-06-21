@@ -71,7 +71,7 @@ docker-compose.yml            Local Airflow stack
 ## Model Deployment Aliases
 
 Trained model artifacts are immutable under `model_bank/runs/{run_id}` in R2.
-Deployment aliases assign the `production` and `candidate` roles without moving
+Deployment aliases assign the `production` and `shadow` roles without moving
 or copying those artifacts. Each alias update also creates an immutable event
 under the configured `model_bank.deployment_history` path.
 
@@ -79,55 +79,62 @@ Set an alias from the project runtime image:
 
 ```bash
 python include/inference/model_registry.py set \
-  --alias candidate \
+  --alias shadow \
   --run-id 20260613T120000Z \
   --actor airflow \
-  --reason "June batch canary"
+  --reason "June shadow evaluation"
 ```
 
 Read the current alias:
 
 ```bash
-python include/inference/model_registry.py get --alias candidate
+python include/inference/model_registry.py get --alias shadow
 ```
 
 The referenced `model_bank/runs/{run_id}` must already exist. Batch jobs should
 resolve aliases once at startup and persist the resolved run IDs in their batch
 manifest.
 
-## Batch Canary Inference
+## Batch Shadow Inference
 
-The `batch_inference_pipeline` DAG performs a normal batch canary deployment.
+The `batch_inference_pipeline` DAG performs batch inference with optional shadow
+scoring.
 It expects an inference-ready Delta table at `gold/inference_features` with one
 row per `document_id` and a Spark ML vector column named `features`. A different
 input path can be supplied when manually triggering the DAG.
 
-The DAG runs one idempotent task. On its first attempt it reads the `production`
-and `candidate` aliases and freezes them in a manifest. Retries reuse that
-manifest, then assign documents deterministically, score each cohort, and write
-versioned Delta predictions.
+The DAG first assembles deployment-specific feature tables. Production features
+are written to `gold/batch_inference/{batch_id}/features/production`; when a
+distinct shadow model is enabled, shadow features are written to
+`gold/batch_inference/{batch_id}/features/shadow`. Each table is built from that
+model's own manifest, so frozen TF-IDF/IDF and DCW statistics come from the
+correct `feature_run_id`.
+
+On its first scoring attempt, the DAG reads the `production` and optional
+`shadow` model configs and freezes their feature input paths and Delta versions
+in a manifest. Retries reuse that manifest, then score the full batch with
+production and, when configured, score the same full batch with shadow.
 
 The manifest records both the inference input path and its Delta table version.
-Inference retries and canary rollbacks read that exact version with
-`versionAsOf`, so later changes to the input table do not change the batch.
+Inference retries read that exact version with `versionAsOf`, so later changes
+to the input table do not change the batch.
 
-Before reading and splitting that input, the job validates every referenced
-model run. It checks metadata and label mappings, model paths, run IDs,
-thresholds, label counts, loadability, and production/candidate feature-set
-compatibility. Loaded models are reused for scoring.
+Before scoring, the job validates every referenced model run. It checks metadata
+and label mappings, model paths, run IDs, thresholds, label counts, loadability,
+and that each deployment's feature table was assembled with the feature run its
+model expects. Loaded models are reused for scoring.
 
-Trigger it with an optional canary percentage and input path:
+Trigger it with an optional input path:
 
 ```json
 {
-  "canary_percentage": 5,
   "input_path": "s3a://cs611-project/gold/inference_features"
 }
 ```
 
-The `production` alias is required. The `candidate` alias is optional. When no
-candidate is set, when it points to the same run as production, or when
-`canary_percentage` is `0`, the entire dataset is scored by production.
+The `production` alias is required. The `shadow` alias is optional. When no
+shadow is set, or when it points to the same run as production, only production
+is scored.
 
 Outputs are written under:
 
@@ -139,15 +146,16 @@ gold/published_predictions
 ```
 
 Prediction rows include `batch_id`, `document_id`, `model_run_id`,
-`deployment_group`, `predicted_labels`, and the prediction timestamp. The input
-dataset is sorted deterministically and split into production and candidate
-groups using the requested canary proportion. This DAG does not promote the
-candidate alias; promotion remains a separate deployment decision.
+`deployment_group`, `predicted_labels`, and the prediction timestamp. Staged
+batch predictions include production rows and, when configured, shadow rows.
+The canonical `gold/published_predictions` table receives production rows only.
+This DAG does not promote the shadow alias; promotion remains a separate
+deployment decision.
 
 Before predictions are written, the job rejects empty inputs, null or duplicate
 document IDs, missing or duplicate predictions, incorrect model assignments,
-invalid labels, and incorrect production/candidate counts. A successful
-`validation.json` records the input, prediction, production, and candidate row
+invalid labels, and incorrect production/shadow counts. A successful
+`validation.json` records the input, prediction, production, and shadow row
 counts while leaving the frozen manifest unchanged.
 
 After validation, the job publishes into the canonical
@@ -155,31 +163,13 @@ After validation, the job publishes into the canonical
 later runs use a Delta `MERGE` keyed by `(batch_id, document_id)`, so retrying
 the same Airflow batch updates its rows instead of creating duplicates.
 
-## Roll Back A Canary Batch
+Monitoring reads staged shadow rows from `gold/batch_inference/{batch_id}/predictions`
+and plots shadow performance alongside production when reviewed labels are
+available.
 
-Trigger the manual `rollback_canary_pipeline` DAG with the original batch ID:
-
-```json
-{
-  "batch_id": "20260613T120000"
-}
-```
-
-The rollback job requires a passed `validation.json` and a batch that actually
-used a candidate. It reads the original candidate document IDs from staged
-predictions, rescores only those documents with the production run frozen in
-the manifest, and merges the replacements into `gold/published_predictions`.
-It records the result at:
-
-```text
-gold/batch_inference/{batch_id}/rollback.json
-```
-
-Completed rollback records make repeated Airflow runs idempotent.
-
-Both inference and rollback Airflow tasks retry twice with exponential backoff:
-the first retry waits five minutes and delays are capped at 30 minutes. Batch
-inference has a four-hour execution timeout; rollback has a two-hour timeout.
+Inference Airflow tasks retry twice with exponential backoff: the first retry
+waits five minutes and delays are capped at 30 minutes. Batch inference has a
+four-hour execution timeout.
 
 ## Jupyter Notebook
 

@@ -5,7 +5,7 @@ deployment:
     model_type: logistic_regression
     model_date: "20260615"
 
-  candidate:
+  shadow:
     enabled: false
     run_id:
     exp_id:

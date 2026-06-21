@@ -157,6 +157,7 @@ def load_paths(
     schema: dict,
     feature_config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml",
     input_path: str | None = None,
+    batch_id: str | None = None,
 ) -> dict:
     gold = schema["gold"]
     gold_base = gold["path"].rstrip("/")
@@ -183,10 +184,16 @@ def load_paths(
         or "label_store"
     )
     published_predictions_path = tables.get("published_predictions", {}).get("path") or "published_predictions"
+    batch_inference_path = tables.get("batch_inference", {}).get("path") or "batch_inference"
+    configured_input_paths = configured_features.get("input_paths") or {}
+    if configured_input_paths and not isinstance(configured_input_paths, dict):
+        raise ValueError("Feature config field 'features.input_paths' must be a mapping")
     inference_features_path = (
         input_path
         or configured_features.get("input_path")
+        or configured_input_paths.get("production")
         or tables.get("inference_features", {}).get("path")
+        or (f"{batch_inference_path}/{batch_id}/features/production" if batch_id else None)
         or f"{runs.get('base', 'runs')}/{gold_run_id}/{runs.get('X_unlabelled', 'X_unlabelled')}"
     )
     model_bank_base = schema["model_bank"]["path"].rstrip("/")
@@ -197,6 +204,7 @@ def load_paths(
         "label_store": _join_storage_path(gold_base, str(label_store_path)),
         # Served predictions; the reviewed 10% are a subset of each batch.
         "published_predictions": _join_storage_path(gold_base, str(published_predictions_path)),
+        "batch_inference_base": _join_storage_path(gold_base, str(batch_inference_path)),
         "model_bank_base": model_bank_base,
         # v2 layout bases. These dirs are NOT in this branch's schema.yaml, so they
         # are hardcoded here (see GOLD_RUNS_DIR / GOLD_MODEL_PREDICTIONS_DIR).
@@ -634,23 +642,40 @@ def _parse_metrics_date(metrics_path: str) -> str | None:
 
 def load_shadow_performance(spark, paths: dict, batch_id: str, label_list: list[str]) -> dict | None:
     """
-    Optional shadow-model performance for this batch (exploratory). Returns None when
-    no shadow model is configured (SHADOW_MODEL_PATH is None), so the shadow line is
-    simply absent. When configured, SHADOW_MODEL_PATH is the shadow model's
-    predictions table (expected columns: document_id, predicted_labels, and batch_id
-    if multi-batch); its predictions on the reviewed 10% are scored against ground
-    truth, exactly like production.
+    Optional shadow-model performance for this batch. Prefer the batch inference
+    artifact written at gold/batch_inference/{batch_id}/predictions, where shadow
+    rows have deployment_group='shadow'. SHADOW_MODEL_PATH remains as a manual
+    fallback for externally-produced shadow predictions.
     """
+    from pyspark.sql import functions as F
+
+    staged_path = f"{paths['batch_inference_base']}/{batch_id}/predictions"
+    if hadoop_path_exists(spark, staged_path):
+        staged = spark.read.format("delta").load(staged_path)
+        if "deployment_group" in staged.columns:
+            shadow_predictions = staged.filter(F.col("deployment_group") == "shadow")
+            if shadow_predictions.limit(1).count():
+                run_ids = [row["model_run_id"] for row in shadow_predictions.select("model_run_id").distinct().collect() if row["model_run_id"]]
+                performance = compute_performance(
+                    load_ground_truth(spark, paths),
+                    shadow_predictions.select("document_id", "predicted_labels"),
+                    label_list,
+                )
+                if performance:
+                    performance["run_id"] = run_ids[0] if len(run_ids) == 1 else "shadow"
+                return performance
+
     if SHADOW_MODEL_PATH is None:
         return None
-
-    from pyspark.sql import functions as F
 
     shadow_predictions = spark.read.format("delta").load(SHADOW_MODEL_PATH)
     if "batch_id" in shadow_predictions.columns:
         shadow_predictions = shadow_predictions.filter(F.col("batch_id") == batch_id)
     shadow_predictions = shadow_predictions.select("document_id", "predicted_labels")
-    return compute_performance(load_ground_truth(spark, paths), shadow_predictions, label_list)
+    performance = compute_performance(load_ground_truth(spark, paths), shadow_predictions, label_list)
+    if performance:
+        performance["run_id"] = "shadow"
+    return performance
 
 
 # Models tracked as their own trend line. Production is the champion; shadow is an
@@ -1408,7 +1433,7 @@ def run_monitoring(
     production is tracked.
     """
     schema = load_schema()
-    paths = load_paths(schema, feature_config_path, input_path)
+    paths = load_paths(schema, feature_config_path, input_path, batch_id)
     monitored_at = datetime.now(timezone.utc).isoformat()
     base_dir = f"{paths['monitoring_base']}/{batch_id}"
     logger.info("Monitoring batch %s -> %s", batch_id, base_dir)
@@ -1422,7 +1447,7 @@ def run_monitoring(
         shadow_performance = load_shadow_performance(spark, paths, batch_id, t0["labels"])
         if shadow_performance:
             shadow = {
-                "run_id": "shadow",
+                "run_id": shadow_performance.get("run_id", "shadow"),
                 "macro_f1": shadow_performance["macro_f1"],
                 "hamming_loss": shadow_performance["hamming_loss"],
                 "macro_f1_gyr": _classify_higher_is_better(shadow_performance["macro_f1"], MACRO_F1_GREEN, MACRO_F1_YELLOW),

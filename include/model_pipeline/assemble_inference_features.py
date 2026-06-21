@@ -1,4 +1,4 @@
-"""Assemble inference-ready X_unlabelled from Gold corpus tables.
+"""Assemble deployment-specific inference feature tables from Gold corpus tables.
 
 This applies frozen feature artifacts from model_bank/features/{feature_run_id}
 to documents marked with category='inference' in gold/label_store. It does not
@@ -79,25 +79,38 @@ def _manifest_value(manifest: dict[str, Any], key: str) -> str | None:
     return str(value).strip() or None
 
 
-def _deployment_model_config(config: dict[str, Any]) -> dict[str, Any]:
+def _deployment_model_configs(config: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     deployment_config = config.get("deployment") or {}
     if not isinstance(deployment_config, dict):
         raise ValueError("Feature assembly config field 'deployment' must be a mapping")
     production_config = deployment_config.get("production") or {}
     if not isinstance(production_config, dict) or not production_config:
         raise ValueError("Feature assembly config must define deployment.production")
-    return production_config
+    contexts = [("production", production_config)]
+
+    shadow_config = deployment_config.get("shadow")
+    if shadow_config is not None:
+        if not isinstance(shadow_config, dict):
+            raise ValueError("Feature assembly config field 'deployment.shadow' must be a mapping")
+        if shadow_config.get("enabled") is not False:
+            shadow_run_id = _clean_optional(shadow_config.get("run_id")) or _clean_optional(shadow_config.get("exp_id"))
+            production_run_id = _clean_optional(production_config.get("run_id")) or _clean_optional(production_config.get("exp_id"))
+            if not shadow_run_id and shadow_config.get("enabled") is True:
+                raise ValueError("Feature assembly config deployment.shadow must define run_id when enabled")
+            if shadow_run_id and shadow_run_id != production_run_id:
+                contexts.append(("shadow", shadow_config))
+    return contexts
 
 
-def resolve_feature_assembly_context(spark, args: argparse.Namespace) -> dict[str, Any]:
-    """Resolve model-selected feature inputs for inference feature assembly."""
-    config = load_assembly_config(args.config)
-    model_config = _deployment_model_config(config)
-    feature_config = config.get("features") or {}
-
-    if not isinstance(feature_config, dict):
-        raise ValueError("Feature assembly config field 'features' must be a mapping")
-
+def _resolve_model_context(
+    spark,
+    alias: str,
+    model_config: dict[str, Any],
+    feature_config: dict[str, Any],
+    category: str | None,
+) -> dict[str, Any]:
+    """Resolve model-selected feature inputs for one deployment alias."""
+    run_id = _clean_optional(model_config.get("run_id")) or _clean_optional(model_config.get("exp_id"))
     exp_id = _clean_optional(model_config.get("exp_id"))
     model_type = _clean_optional(model_config.get("model_type"))
     model_date = _clean_optional(model_config.get("model_date"))
@@ -105,9 +118,9 @@ def resolve_feature_assembly_context(spark, args: argparse.Namespace) -> dict[st
     manifest: dict[str, Any] | None = None
     manifest_path: str | None = None
     if not exp_id:
-        raise ValueError("Feature assembly config deployment.production must define exp_id")
+        raise ValueError(f"Feature assembly config deployment.{alias} must define exp_id")
     if not model_type:
-        raise ValueError("Feature assembly config deployment.production must define model_type")
+        raise ValueError(f"Feature assembly config deployment.{alias} must define model_type")
     manifest, manifest_path = load_training_manifest(spark, exp_id, model_date, model_type=model_type)
 
     feature_run_id = _manifest_value(manifest or {}, "feature_run_id")
@@ -117,11 +130,19 @@ def resolve_feature_assembly_context(spark, args: argparse.Namespace) -> dict[st
     if not feature_set:
         raise ValueError(f"Model manifest for {exp_id!r} must define feature_set")
 
-    gold_run_id = _clean_optional(feature_config.get("gold_run_id")) or _manifest_value(manifest or {}, "gold_run_id") or feature_run_id
-    category = _clean_optional(feature_config.get("category")) or _clean_optional(args.category) or DEFAULT_INFERENCE_CATEGORY
+    gold_run_ids = feature_config.get("gold_run_ids") or {}
+    if gold_run_ids and not isinstance(gold_run_ids, dict):
+        raise ValueError("Feature assembly config field 'features.gold_run_ids' must be a mapping")
+    gold_run_id = (
+        _clean_optional(gold_run_ids.get(alias))
+        or _clean_optional(feature_config.get("gold_run_id"))
+        or _manifest_value(manifest or {}, "gold_run_id")
+        or feature_run_id
+    )
 
     return {
-        "config": config,
+        "alias": alias,
+        "run_id": run_id,
         "exp_id": exp_id,
         "model_type": model_type or _manifest_value(manifest or {}, "model_type"),
         "model_date": model_date,
@@ -131,6 +152,38 @@ def resolve_feature_assembly_context(spark, args: argparse.Namespace) -> dict[st
         "feature_set": feature_set,
         "category": category,
     }
+
+
+def resolve_feature_assembly_contexts(spark, args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Resolve model-selected feature inputs for production and optional shadow."""
+    config = load_assembly_config(args.config)
+    feature_config = config.get("features") or {}
+    if not isinstance(feature_config, dict):
+        raise ValueError("Feature assembly config field 'features' must be a mapping")
+
+    category = _clean_optional(feature_config.get("category")) or _clean_optional(args.category) or DEFAULT_INFERENCE_CATEGORY
+    return [
+        _resolve_model_context(spark, alias, model_config, feature_config, category)
+        for alias, model_config in _deployment_model_configs(config)
+    ]
+
+
+def load_batch_feature_base(config_path: str | Path | None, batch_id: str) -> str:
+    config = load_assembly_config(config_path)
+    feature_config = config.get("features") or {}
+    if not isinstance(feature_config, dict):
+        raise ValueError("Feature assembly config field 'features' must be a mapping")
+    output_base = feature_config.get("output_base")
+    if output_base:
+        return str(output_base).rstrip("/")
+
+    with (_PROJECT_ROOT / "schema.yaml").open() as schema_file:
+        schema = yaml.safe_load(schema_file)
+    gold = schema["gold"]
+    gold_base = gold["path"].rstrip("/")
+    tables = gold.get("tables") or {}
+    batch_inference = tables.get("batch_inference", {}).get("path") or "batch_inference"
+    return f"{gold_base}/{batch_inference}/{batch_id}/features"
 
 
 def _dcw_score_from_artifact(spark, paths: dict[str, str]) -> dict[str, float]:
@@ -268,17 +321,17 @@ def assemble_inference_features(spark, paths: dict[str, str], *, feature_set: st
     return output
 
 
-def write_x_unlabelled(df: DataFrame, path: str, batch_id: str | None) -> None:
+def write_inference_features(df: DataFrame, path: str, batch_id: str | None) -> None:
     writer = df.write.format("delta").option("mergeSchema", "true")
     if batch_id and "batch_id" in df.columns:
         (writer.mode("overwrite").partitionBy("batch_id").option("replaceWhere", f"batch_id = '{batch_id}'").save(path))
     else:
         writer.mode("overwrite").save(path)
-    logger.info("Wrote X_unlabelled to %s", path)
+    logger.info("Wrote inference features to %s", path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Assemble inference X_unlabelled from Gold corpus features")
+    parser = argparse.ArgumentParser(description="Assemble deployment-specific inference features from Gold corpus features")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument("--category", default=DEFAULT_INFERENCE_CATEGORY)
     parser.add_argument("--batch-id", required=True)
@@ -294,25 +347,29 @@ def main() -> None:
 
     spark = create_pipeline_spark_session("assemble-inference-features")
     try:
-        context = resolve_feature_assembly_context(spark, args)
-        paths = load_schema_paths(context["feature_run_id"], gold_run_id=context["gold_run_id"])
-        logger.info("Model exp_id: %s", context.get("exp_id") or "<manual>")
-        logger.info("Model manifest: %s", context.get("model_manifest_path") or "<none>")
-        logger.info("Feature run: %s", context["feature_run_id"])
-        logger.info("Feature set: %s", context["feature_set"])
-        logger.info("Gold run: %s", context["gold_run_id"])
-        logger.info("Output X_unlabelled: %s", paths["X_unlabelled"])
+        contexts = resolve_feature_assembly_contexts(spark, args)
+        feature_base = load_batch_feature_base(args.config, args.batch_id)
+        for context in contexts:
+            paths = load_schema_paths(context["feature_run_id"], gold_run_id=context["gold_run_id"])
+            output_path = f"{feature_base}/{context['alias']}"
+            logger.info("Deployment group: %s", context["alias"])
+            logger.info("Model exp_id: %s", context.get("exp_id") or "<manual>")
+            logger.info("Model manifest: %s", context.get("model_manifest_path") or "<none>")
+            logger.info("Feature run: %s", context["feature_run_id"])
+            logger.info("Feature set: %s", context["feature_set"])
+            logger.info("Gold run: %s", context["gold_run_id"])
+            logger.info("Output inference features: %s", output_path)
 
-        output = assemble_inference_features(
-            spark,
-            paths,
-            feature_set=context["feature_set"],
-            category=context["category"],
-            batch_id=args.batch_id,
-            limit=args.limit,
-            model_context=context,
-        )
-        write_x_unlabelled(output, paths["X_unlabelled"], args.batch_id)
+            output = assemble_inference_features(
+                spark,
+                paths,
+                feature_set=context["feature_set"],
+                category=context["category"],
+                batch_id=args.batch_id,
+                limit=args.limit,
+                model_context=context,
+            ).withColumn("deployment_group", F.lit(context["alias"]))
+            write_inference_features(output, output_path, args.batch_id)
     finally:
         spark.stop()
 
