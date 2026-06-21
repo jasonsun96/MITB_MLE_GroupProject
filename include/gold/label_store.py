@@ -129,7 +129,8 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
 
     pre_oot_rows = pre_oot.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
     if not pre_oot_rows:
-        raise ValueError("No pre-OOT documents available for train/validation/test splitting")
+        logger.info("No pre-OOT documents available; returning OOT/inference-only split assignment")
+        return oot.unionByName(inference)
 
     assignments, stratified_label_count = split_pre_oot_documents(pre_oot_rows, random_seed=random_seed)
     assignment_schema = T.StructType(
@@ -168,6 +169,11 @@ def main() -> None:
         default=DEFAULT_OOT_START_YEAR,
         help="First snapshot year assigned to the out-of-time set",
     )
+    parser.add_argument(
+        "--snapshot-date",
+        default=None,
+        help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -189,6 +195,9 @@ def main() -> None:
 
     spark = create_spark_session("gold-label-store")
     silver_df = spark.read.format("delta").load(input_path)
+    if args.snapshot_date:
+        silver_df = silver_df.filter(F.col(PARTITION_COL) == F.lit(args.snapshot_date))
+        logger.info("Scoped label store extraction to snapshot_date=%s", args.snapshot_date)
     label_store = build_label_store(silver_df)
     label_store = assign_splits(
         label_store,
@@ -198,7 +207,12 @@ def main() -> None:
     )
 
     try:
-        write_delta(label_store, output_path, partition_col=PARTITION_COL)
+        write_delta(
+            label_store,
+            output_path,
+            partition_col=PARTITION_COL,
+            replace_partition_value=args.snapshot_date,
+        )
     except Exception:
         logger.exception("Failed to write Gold label store to %s", output_path)
         raise

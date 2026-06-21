@@ -170,6 +170,11 @@ def main():
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     )
+    parser.add_argument(
+        "--snapshot-date",
+        default=None,
+        help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -191,6 +196,9 @@ def main():
 
     spark = create_spark_session("gold-ngram-counts")
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col(PARTITION_COL) == F.lit(args.snapshot_date))
+        logger.info("Scoped n-gram extraction to snapshot_date=%s", args.snapshot_date)
 
     if ID_COLUMN not in raw.columns:
         raise ValueError(f"Required column missing from silver input: {ID_COLUMN}")
@@ -263,6 +271,8 @@ def main():
     )
 
     writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"{PARTITION_COL} = '{args.snapshot_date}'")
     if PARTITION_COL in result.columns:
         writer = writer.partitionBy(PARTITION_COL)
     writer.save(OUTPUT_PATH)

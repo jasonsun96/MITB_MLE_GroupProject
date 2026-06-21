@@ -42,6 +42,11 @@ parser.add_argument(
     default=None,
     help="Limit to N rows for smoke testing. Omit for full corpus.",
 )
+parser.add_argument(
+    "--snapshot-date",
+    default=None,
+    help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+)
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -145,6 +150,9 @@ def main():
     spark = create_spark_session("gold-pos-counts")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col("snapshot_date") == F.lit(args.snapshot_date))
+        logger.info("Scoped POS-count extraction to snapshot_date=%s", args.snapshot_date)
 
     # truncate doc text at spark level. 500k chars is well past p95 of the
     # corpus, so we lose ~nothing from real docs but cap the python worker
@@ -184,7 +192,10 @@ def main():
         F.col("_pos.n_total_tokens").alias("n_total_tokens"),
     )
 
-    (result.write.format("delta").mode("overwrite").option("mergeSchema", "true").partitionBy("snapshot_date").save(OUTPUT_PATH))
+    writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"snapshot_date = '{args.snapshot_date}'")
+    writer.partitionBy("snapshot_date").save(OUTPUT_PATH)
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

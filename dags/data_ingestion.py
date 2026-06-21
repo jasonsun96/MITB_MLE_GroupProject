@@ -22,8 +22,10 @@ COMMON = dict(
 
 with DAG(
     dag_id="medallion_pipeline",
-    start_date=datetime.datetime(2024, 1, 1),
-    schedule="@monthly",
+    start_date=datetime.datetime(2005, 1, 1),
+    end_date=datetime.datetime(2005, 12, 31),
+    schedule="@daily",
+    catchup=False,
 ):
     # ---- bronze ----
     bronze_ingest = DockerOperator(
@@ -40,7 +42,7 @@ with DAG(
     # ---- silver ----
     silver_legal = DockerOperator(
         task_id="process_silver_legal_docs",
-        command="python include/silver/process_legal_docs.py",
+        command="python include/silver/process_legal_docs.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
@@ -53,26 +55,26 @@ with DAG(
     # ---- gold: label store (train/val/test/oot split assignment) ----
     build_label_store = DockerOperator(
         task_id="build_label_store",
-        command="python include/gold/label_store.py",
+        command="python include/gold/label_store.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     # ---- gold: per-document features (all read from silver) ----
     gold_ngram_counts = DockerOperator(
         task_id="extract_ngram_counts",
-        command="python include/gold/ngram_processing.py",
+        command="python include/gold/ngram_processing.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     gold_pos_counts = DockerOperator(
         task_id="extract_pos_counts",
-        command="python include/gold/pos_counts.py",
+        command="python include/gold/pos_counts.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     gold_legal_embeddings = DockerOperator(
         task_id="extract_legal_embeddings",
-        command="python include/gold/legal_embeddings.py",
+        command="python include/gold/legal_embeddings.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 

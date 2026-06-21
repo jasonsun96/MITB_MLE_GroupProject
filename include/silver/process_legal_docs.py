@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import yaml
+from delta.tables import DeltaTable
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -13,6 +14,11 @@ from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Silver layer legal document processing pipeline")
 parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+parser.add_argument(
+    "--snapshot-date",
+    default=None,
+    help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+)
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -237,8 +243,11 @@ def add_cleaning_summary_flags(df):
     return df.withColumn("has_text_quality_issue", has_quality_issue)
 
 
-def process_legal_docs(bronze_table_path, silver_table_path, spark):
+def process_legal_docs(bronze_table_path, silver_table_path, spark, snapshot_date=None):
     df = spark.read.format("delta").load(bronze_table_path)
+    if snapshot_date:
+        df = df.filter(F.col("snapshot_date") == F.lit(snapshot_date))
+        logger.info("Scoped legal silver processing to snapshot_date=%s", snapshot_date)
 
     processed = df
     processed = initialize_clean_text(processed)
@@ -262,8 +271,11 @@ def process_legal_docs(bronze_table_path, silver_table_path, spark):
     processed = add_cleaning_summary_flags(processed)
 
     try:
-        writer = processed.write.format("delta").option("mergeSchema", "true")
-        writer.mode("overwrite").save(silver_table_path)
+        if snapshot_date:
+            DeltaTable.forPath(spark, silver_table_path).delete(f"snapshot_date = '{snapshot_date}'")
+            processed.write.format("delta").mode("append").option("mergeSchema", "true").save(silver_table_path)
+        else:
+            processed.write.format("delta").mode("overwrite").option("mergeSchema", "true").save(silver_table_path)
 
     except Exception:
         logger.exception("Failed to process silver table from %s", bronze_table_path)
@@ -272,7 +284,7 @@ def process_legal_docs(bronze_table_path, silver_table_path, spark):
 
 bronze_table_path = f"{BRONZE_PATH}/{BRONZE_TABLES['legal_docs_raw']['path']}"
 silver_table_path = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
-process_legal_docs(bronze_table_path, silver_table_path, spark)
+process_legal_docs(bronze_table_path, silver_table_path, spark, snapshot_date=args.snapshot_date)
 
 
 logger.info("Silver processing complete")

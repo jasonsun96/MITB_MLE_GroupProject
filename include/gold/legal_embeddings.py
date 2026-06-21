@@ -48,6 +48,11 @@ parser.add_argument(
     default="silver",
     choices=["bronze", "silver"],
 )
+parser.add_argument(
+    "--snapshot-date",
+    default=None,
+    help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+)
 args = parser.parse_args()
 
 logging.basicConfig(
@@ -184,6 +189,9 @@ def main():
     spark = create_spark_session("gold-legal-embeddings")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col("snapshot_date") == F.lit(args.snapshot_date))
+        logger.info("Scoped legal embeddings extraction to snapshot_date=%s", args.snapshot_date)
 
     # truncate doc text at spark level. with 5-chunk cap on the python side
     # we'd never use more than ~2500 chars worth of text anyway
@@ -222,7 +230,10 @@ def main():
         F.col("_emb.n_chunks").alias("n_chunks"),
     )
 
-    (result.write.format("delta").mode("overwrite").option("mergeSchema", "true").partitionBy("snapshot_date").save(OUTPUT_PATH))
+    writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"snapshot_date = '{args.snapshot_date}'")
+    writer.partitionBy("snapshot_date").save(OUTPUT_PATH)
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

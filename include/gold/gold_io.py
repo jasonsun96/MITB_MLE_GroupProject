@@ -29,8 +29,10 @@ def columns_with_snapshot(df, columns: list[str]) -> list[str]:
     return cols
 
 
-def write_delta(df, path: str, partition_col: str | None = None) -> None:
+def write_delta(df, path: str, partition_col: str | None = None, replace_partition_value: str | None = None) -> None:
     writer = df.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if partition_col and replace_partition_value is not None:
+        writer = writer.option("replaceWhere", f"{partition_col} = '{replace_partition_value}'")
     if partition_col and partition_col in df.columns:
         writer = writer.partitionBy(partition_col)
 
