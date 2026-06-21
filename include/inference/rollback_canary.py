@@ -15,9 +15,7 @@ from include.inference.batch_inference import (load_paths, publish_predictions,
                                                read_delta_version,
                                                score_cohort,
                                                validate_model_run)
-from include.inference.model_registry import (hadoop_path_exists,
-                                              load_registry_paths, read_json,
-                                              write_json)
+from include.inference.model_registry import hadoop_path_exists, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +91,8 @@ def rollback_batch(spark, batch_id: str) -> dict:
     production_run_id = manifest["production_run_id"]
     production_contract = validate_model_run(
         spark,
-        load_registry_paths(),
         production_run_id,
+        manifest.get("production_model_config"),
     )
     scored = score_cohort(rollback_input, production_contract)
     replacements = scored.select(

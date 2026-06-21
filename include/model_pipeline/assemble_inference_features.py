@@ -12,6 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_PIPELINE_DIR = Path(__file__).resolve().parent
+_INCLUDE_DIR = _PIPELINE_DIR.parent
+_GOLD_DIR = _INCLUDE_DIR / "gold"
+_PROJECT_ROOT = _INCLUDE_DIR.parent
+for _path in (_PROJECT_ROOT, _INCLUDE_DIR, _GOLD_DIR):
+    _entry = str(_path)
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
 import yaml
 from gold_io import load_pickle
 from model_pipeline.multilabel_core import (DCW_FEATURES_COL, DOCUMENT_ID_COL,
@@ -29,15 +38,6 @@ from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
 from pyspark.sql.types import DoubleType, MapType, StringType
 from tfidf_processing import add_tfidf_column, load_tfidf_artifact
-
-_PIPELINE_DIR = Path(__file__).resolve().parent
-_INCLUDE_DIR = _PIPELINE_DIR.parent
-_GOLD_DIR = _INCLUDE_DIR / "gold"
-_PROJECT_ROOT = _INCLUDE_DIR.parent
-for _path in (_PROJECT_ROOT, _INCLUDE_DIR, _GOLD_DIR):
-    _entry = str(_path)
-    if _entry not in sys.path:
-        sys.path.insert(0, _entry)
 
 
 logger = logging.getLogger(__name__)

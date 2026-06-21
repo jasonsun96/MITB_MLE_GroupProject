@@ -17,7 +17,7 @@ R2_ENV = {
     "R2_ACCOUNT_ID": os.environ.get("R2_ACCOUNT_ID", ""),
     "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID", ""),
     "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
-    "PYTHONPATH": "/app",
+    "PYTHONPATH": "/app:/app/include:/app/include/gold",
 }
 
 with DAG(

@@ -131,27 +131,81 @@ def load_schema() -> dict:
         return yaml.safe_load(schema_file)
 
 
-def load_paths(schema: dict) -> dict:
+def _join_storage_path(base: str, path: str) -> str:
+    if "://" in path:
+        return path
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def load_feature_config(config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml") -> dict:
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if not path.exists():
+        logger.info("Feature config not found at %s; using schema defaults", path)
+        return {}
+    with path.open() as config_file:
+        config = yaml.safe_load(config_file) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Feature config must be a YAML mapping: {path}")
+    return config
+
+
+def load_paths(
+    schema: dict,
+    feature_config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml",
+    input_path: str | None = None,
+) -> dict:
     gold = schema["gold"]
     gold_base = gold["path"].rstrip("/")
-    tables = gold["tables"]
+    tables = gold.get("tables") or {}
+    corpus = gold.get("corpus") or {}
+    runs = gold.get("runs") or {}
+    feature_config = load_feature_config(feature_config_path)
+    configured_features = feature_config.get("features") or {}
+    if not isinstance(configured_features, dict):
+        raise ValueError("Feature config field 'features' must be a mapping")
+    gold_run_id = str(
+        configured_features.get("gold_run_id")
+        or runs.get("default_gold_run_id")
+        or runs.get("default_run_id")
+        or ""
+    ).strip()
+    if not gold_run_id and not tables.get("inference_features"):
+        raise ValueError("Cannot resolve inference feature path without gold.runs default run id")
+
+    label_store_path = (
+        tables.get("label_store", {}).get("path")
+        or corpus.get("label_store", {}).get("path")
+        or corpus.get("labels", {}).get("path")
+        or "label_store"
+    )
+    published_predictions_path = tables.get("published_predictions", {}).get("path") or "published_predictions"
+    inference_features_path = (
+        input_path
+        or configured_features.get("input_path")
+        or tables.get("inference_features", {}).get("path")
+        or f"{runs.get('base', 'runs')}/{gold_run_id}/{runs.get('X_unlabelled', 'X_unlabelled')}"
+    )
     model_bank_base = schema["model_bank"]["path"].rstrip("/")
     return {
         "gold_base": gold_base,
         # Ground-truth labels for the reviewed 10% (label_store, filtered to
         # category='production'). 'labels' is an alias to this path.
-        "label_store": f"{gold_base}/{tables['label_store']['path']}",
+        "label_store": _join_storage_path(gold_base, str(label_store_path)),
         # Served predictions; the reviewed 10% are a subset of each batch.
-        "published_predictions": f"{gold_base}/{tables['published_predictions']['path']}",
+        "published_predictions": _join_storage_path(gold_base, str(published_predictions_path)),
         "model_bank_base": model_bank_base,
         # v2 layout bases. These dirs are NOT in this branch's schema.yaml, so they
         # are hardcoded here (see GOLD_RUNS_DIR / GOLD_MODEL_PREDICTIONS_DIR).
         # CSI training baseline = {runs_base}/{feature_run_id}/dcw_train;
         # PSI training baseline = {model_predictions_base}/prediction_date=*/{exp_id}_train.
-        "runs_base": f"{gold_base}/{GOLD_RUNS_DIR}",
-        "model_predictions_base": f"{gold_base}/{GOLD_MODEL_PREDICTIONS_DIR}",
+        "runs_base": _join_storage_path(gold_base, str(runs.get("base") or GOLD_RUNS_DIR)),
+        "model_predictions_base": _join_storage_path(gold_base, str((gold.get("model_predictions") or {}).get("base") or GOLD_MODEL_PREDICTIONS_DIR)),
         # CSI production: assembled inference inputs (carries a dcw_features map for monitoring).
-        "inference_features": f"{gold_base}/{tables['inference_features']['path']}",
+        "inference_features": _join_storage_path(gold_base, str(inference_features_path)),
         # Per-batch monitoring artifacts: monitoring/{batch_id}/metrics.json + dashboard.png
         "monitoring_base": schema["monitoring"]["path"].rstrip("/"),
     }
@@ -1337,7 +1391,12 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
     return block, psi_result, csi_result, csi_values
 
 
-def run_monitoring(spark, batch_id: str) -> dict:
+def run_monitoring(
+    spark,
+    batch_id: str,
+    feature_config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml",
+    input_path: str | None = None,
+) -> dict:
     """
     Daily entrypoint (runs right after batch inference). Computes performance / PSI /
     CSI for the production model on this batch, writes metrics.json, then rebuilds the
@@ -1349,7 +1408,7 @@ def run_monitoring(spark, batch_id: str) -> dict:
     production is tracked.
     """
     schema = load_schema()
-    paths = load_paths(schema)
+    paths = load_paths(schema, feature_config_path, input_path)
     monitored_at = datetime.now(timezone.utc).isoformat()
     base_dir = f"{paths['monitoring_base']}/{batch_id}"
     logger.info("Monitoring batch %s -> %s", batch_id, base_dir)
@@ -1425,6 +1484,8 @@ def run_monitoring(spark, batch_id: str) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch inference monitoring")
     parser.add_argument("--batch-id", required=True)
+    parser.add_argument("--feature-config", default=str(PROJECT_ROOT / "config" / "batch_inference.yaml"))
+    parser.add_argument("--input-path")
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -1442,7 +1503,11 @@ def main() -> None:
 
     spark = create_spark_session("batch-inference-monitoring")
     try:
-        print(json.dumps(run_monitoring(spark, args.batch_id), indent=2, sort_keys=True))
+        print(json.dumps(
+            run_monitoring(spark, args.batch_id, args.feature_config, args.input_path),
+            indent=2,
+            sort_keys=True,
+        ))
     finally:
         spark.stop()
 

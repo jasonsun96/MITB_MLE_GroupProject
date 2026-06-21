@@ -17,7 +17,7 @@ R2_ENV = {
     "R2_ACCOUNT_ID": os.environ.get("R2_ACCOUNT_ID", ""),
     "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID", ""),
     "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
-    "PYTHONPATH": "/app",
+    "PYTHONPATH": "/app:/app/include:/app/include/gold",
 }
 
 COMMON = dict(
@@ -42,7 +42,15 @@ with DAG(
 ):
     assemble_inference_features = DockerOperator(
         task_id="assemble_inference_features",
-        command=("python include/model_pipeline/assemble_inference_features.py " "--batch-id {{ ds_nodash }} " "--config {{ params.feature_config }}"),
+        command=(
+            "{% if params.input_path %}"
+            "python -c \"print('Skipping assemble_inference_features: input_path provided')\""
+            "{% else %}"
+            "python include/model_pipeline/assemble_inference_features.py "
+            "--batch-id {{ ds_nodash }} "
+            "--config {{ params.feature_config }}"
+            "{% endif %}"
+        ),
         execution_timeout=datetime.timedelta(hours=4),
         **COMMON,
     )
@@ -67,7 +75,14 @@ with DAG(
     # monitoring/{batch_id}/ on R2.
     run_monitoring = DockerOperator(
         task_id="run_monitoring",
-        command="python include/monitoring/monitoring.py --batch-id {{ ds_nodash }}",
+        command=(
+            "python include/monitoring/monitoring.py "
+            "--batch-id {{ ds_nodash }} "
+            "--feature-config {{ params.feature_config }} "
+            "{% if params.input_path %}"
+            "--input-path '{{ params.input_path }}'"
+            "{% endif %}"
+        ),
         execution_timeout=datetime.timedelta(hours=1),
         **COMMON,
     )

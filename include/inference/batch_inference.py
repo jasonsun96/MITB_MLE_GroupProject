@@ -258,6 +258,7 @@ def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
         "model_type": model_type,
         "model_manifest_path": manifest_path,
         "feature_set": manifest["feature_set"],
+        "feature_run_id": manifest.get("feature_run_id"),
         "threshold": threshold,
         "labels": labels,
         "models": models,
@@ -288,6 +289,13 @@ def validate_model_contracts(spark, manifest: dict) -> dict:
         candidate_features = contracts["candidate"]["feature_set"]
         if candidate_features != production_features:
             raise ValueError("Production and candidate models require different feature sets: " f"{production_features!r} != {candidate_features!r}")
+        production_feature_run = contracts["production"].get("feature_run_id")
+        candidate_feature_run = contracts["candidate"].get("feature_run_id")
+        if production_feature_run and candidate_feature_run and candidate_feature_run != production_feature_run:
+            raise ValueError(
+                "Production and candidate models require different feature runs: "
+                f"{production_feature_run!r} != {candidate_feature_run!r}"
+            )
     return contracts
 
 
@@ -453,6 +461,19 @@ def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | 
     if "batch_id" in source.columns:
         source = source.filter(F.col("batch_id") == manifest["batch_id"])
     input_count = validate_input(source)
+    expected_feature_run_id = contracts["production"].get("feature_run_id")
+    if expected_feature_run_id and "feature_run_id" in source.columns:
+        unexpected_feature_runs = (
+            source
+            .select("feature_run_id")
+            .distinct()
+            .filter(F.col("feature_run_id").isNull() | (F.col("feature_run_id") != expected_feature_run_id))
+        )
+        if unexpected_feature_runs.limit(1).count():
+            raise ValueError(
+                "Inference input was assembled with a different feature_run_id "
+                f"than the production model expects: {expected_feature_run_id!r}"
+            )
 
     assigned = assign_cohorts(source, manifest["canary_percentage"])
     groups = [("production", manifest["production_run_id"])]
