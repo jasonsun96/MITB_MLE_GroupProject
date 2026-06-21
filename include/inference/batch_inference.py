@@ -7,18 +7,43 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from include.inference.model_registry import (get_alias, hadoop_path_exists,
-                                              load_registry_paths, read_json,
-                                              run_path, write_json)
+from include.inference.model_registry import (hadoop_path_exists, read_json,
+                                              write_json)
+from include.model_pipeline.multilabel_core import (load_trained_models,
+                                                    load_training_manifest)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 logger = logging.getLogger(__name__)
+DEFAULT_FEATURE_CONFIG_PATH = PROJECT_ROOT / "config" / "batch_inference.yaml"
 
 
-def load_paths() -> dict[str, str]:
+def _join_storage_path(base: str, path: str) -> str:
+    if "://" in path:
+        return path
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def load_feature_config(config_path: str | Path | None) -> dict:
+    import yaml
+
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    if not path.exists():
+        raise FileNotFoundError(f"Feature config not found: {path}")
+    with path.open() as config_file:
+        config = yaml.safe_load(config_file) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"Feature config must be a YAML mapping: {path}")
+    return config
+
+
+def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict[str, str]:
     import yaml
 
     with (PROJECT_ROOT / "schema.yaml").open() as schema_file:
@@ -27,17 +52,78 @@ def load_paths() -> dict[str, str]:
     gold = schema["gold"]
     base = gold["path"].rstrip("/")
     tables = gold.get("tables") or {}
-    inference_features = (
-        tables.get("inference_features", {}).get("path")
-        or f"{gold['runs']['base']}/{gold['runs'].get('default_gold_run_id', gold['runs']['default_run_id'])}/{gold['runs']['X_unlabelled']}"
-    )
+    feature_config = load_feature_config(feature_config_path)
+    feature_paths = feature_config.get("features") or {}
+    if not isinstance(feature_paths, dict):
+        raise ValueError("Feature config field 'features' must be a mapping")
+
+    configured_input = feature_paths.get("input_path")
+    configured_gold_run_id = feature_paths.get("gold_run_id")
+    default_gold_run_id = gold["runs"].get("default_gold_run_id", gold["runs"]["default_run_id"])
+    gold_run_id = str(configured_gold_run_id or default_gold_run_id).strip()
+    inference_features = configured_input or tables.get("inference_features", {}).get("path") or f"{gold['runs']['base']}/{gold_run_id}/{gold['runs']['X_unlabelled']}"
     batch_inference = tables.get("batch_inference", {}).get("path") or "batch_inference"
     published_predictions = tables.get("published_predictions", {}).get("path") or "published_predictions"
     return {
-        "input": f"{base}/{inference_features}",
-        "output": f"{base}/{batch_inference}",
-        "published_predictions": f"{base}/{published_predictions}",
+        "input": _join_storage_path(base, str(inference_features)),
+        "output": _join_storage_path(base, str(batch_inference)),
+        "published_predictions": _join_storage_path(base, str(published_predictions)),
     }
+
+
+def _clean_optional(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
+    deployment = config.get("deployment") or {}
+    if not isinstance(deployment, dict):
+        raise ValueError("Feature config field 'deployment' must be a mapping")
+
+    entry = deployment.get(name)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError(f"Feature config field 'deployment.{name}' must be a mapping")
+
+    if name == "candidate" and entry.get("enabled") is False:
+        return None
+
+    run_id = _clean_optional(entry.get("run_id")) or _clean_optional(entry.get("exp_id"))
+    if not run_id:
+        if name == "production" or entry.get("enabled") is True:
+            raise ValueError(f"Feature config deployment.{name} must define run_id")
+        return None
+    exp_id = _clean_optional(entry.get("exp_id"))
+    model_type = _clean_optional(entry.get("model_type"))
+    if not exp_id:
+        raise ValueError(f"Feature config deployment.{name} must define exp_id")
+    if not model_type:
+        raise ValueError(f"Feature config deployment.{name} must define model_type")
+
+    return {
+        "alias": name,
+        "run_id": run_id,
+        "exp_id": exp_id,
+        "model_type": model_type,
+        "model_date": _clean_optional(entry.get("model_date")),
+        "source": "github_config",
+    }
+
+
+def load_deployment_aliases(feature_config_path: str | Path | None) -> tuple[dict, dict | None]:
+    config = load_feature_config(feature_config_path)
+    production = _deployment_alias_from_config(config, "production")
+    candidate = _deployment_alias_from_config(config, "candidate")
+    if not production:
+        raise ValueError("Feature config must define deployment.production.run_id")
+    logger.info("Using Git-configured production model run: %s", production["run_id"])
+    if candidate:
+        logger.info("Using Git-configured candidate model run: %s", candidate["run_id"])
+    return production, candidate
 
 
 def canary_document_count(total_documents: int, canary_percentage: float) -> int:
@@ -67,18 +153,14 @@ def read_delta_version(spark, path: str, version: int | None = None):
     return reader.load(path)
 
 
-def load_or_create_manifest(spark, batch_id: str, canary_percentage: float, input_path: str | None) -> dict:
-    paths = load_paths()
+def load_or_create_manifest(spark, batch_id: str, canary_percentage: float, input_path: str | None, feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict:
+    paths = load_paths(feature_config_path)
     manifest_path = f"{paths['output']}/{batch_id}/manifest.json"
     if hadoop_path_exists(spark, manifest_path):
         logger.info("Reusing manifest at %s", manifest_path)
         return read_json(spark, manifest_path)
 
-    registry_paths = load_registry_paths()
-    production = get_alias(spark, registry_paths, "production")
-    candidate = get_alias(spark, registry_paths, "candidate")
-    if not production:
-        raise ValueError("Production alias must be set")
+    production, candidate = load_deployment_aliases(feature_config_path)
     if not 0 <= canary_percentage < 100:
         raise ValueError("canary_percentage must be between 0 and 100")
 
@@ -99,6 +181,9 @@ def load_or_create_manifest(spark, batch_id: str, canary_percentage: float, inpu
         "production_run_id": production["run_id"],
         "candidate_run_id": candidate_run_id if use_canary else None,
         "canary_percentage": canary_percentage if use_canary else 0,
+        "deployment_source": production["source"],
+        "production_model_config": production,
+        "candidate_model_config": candidate if use_canary else None,
     }
     write_json(spark, manifest_path, manifest, overwrite=False)
     return manifest
@@ -140,66 +225,65 @@ def validate_input(df) -> int:
     return input_count
 
 
-def validate_model_run(spark, registry_paths: dict[str, str], run_id: str) -> dict:
-    from pyspark.ml.classification import RandomForestClassificationModel
+def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
+    exp_id = _clean_optional(model_config.get("exp_id"))
+    model_type = _clean_optional(model_config.get("model_type"))
+    model_date = _clean_optional(model_config.get("model_date"))
+    if not exp_id:
+        raise ValueError(f"Model config for run {run_id} must define exp_id")
+    if not model_type:
+        raise ValueError(f"Model config for run {run_id} must define model_type")
 
-    root = run_path(registry_paths, run_id)
-    metadata_path = f"{root}/metadata.json"
-    label_mapping_path = f"{root}/label_mapping.json"
-    for path in (root, metadata_path, label_mapping_path):
-        if not hadoop_path_exists(spark, path):
-            raise FileNotFoundError(f"Required model artifact does not exist: {path}")
+    manifest, manifest_path = load_training_manifest(
+        spark,
+        exp_id,
+        model_date,
+        model_type=model_type,
+    )
+    per_label_paths = manifest.get("per_label_model_paths")
+    if not isinstance(per_label_paths, dict) or not per_label_paths:
+        raise ValueError(f"Model manifest at {manifest_path} missing per_label_model_paths")
+    if not manifest.get("feature_set"):
+        raise ValueError(f"Model manifest at {manifest_path} missing feature_set")
 
-    metadata = read_json(spark, metadata_path)
-    label_mapping = read_json(spark, label_mapping_path)
-    if metadata.get("run_id") != run_id:
-        raise ValueError(f"Model metadata run_id does not match manifest run: {run_id}")
-    if not metadata.get("feature_set"):
-        raise ValueError(f"Model run {run_id} has no feature_set in metadata")
-
-    try:
-        threshold = float(metadata["multilabel_threshold"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"Model run {run_id} has an invalid multilabel_threshold") from exc
+    threshold = float(manifest.get("multilabel_threshold", 0.5))
     if not 0 <= threshold <= 1:
-        raise ValueError(f"Model run {run_id} threshold must be between 0 and 1")
+        raise ValueError(f"Model manifest at {manifest_path} has invalid multilabel_threshold")
 
-    labels = label_mapping.get("labels")
-    model_paths = label_mapping.get("model_paths")
-    if not isinstance(labels, list) or not labels:
-        raise ValueError(f"Model run {run_id} must contain a nonempty labels list")
-    if len(labels) != len(set(labels)):
-        raise ValueError(f"Model run {run_id} contains duplicate labels")
-    if not isinstance(model_paths, dict):
-        raise ValueError(f"Model run {run_id} has no model_paths mapping")
-    if label_mapping.get("num_labels") != len(labels):
-        raise ValueError(f"Model run {run_id} num_labels does not match labels")
-
-    models = {}
-    for label in labels:
-        model_path = model_paths.get(label)
-        if not model_path:
-            raise ValueError(f"Model run {run_id} has no model path for label {label!r}")
-        if not hadoop_path_exists(spark, model_path):
-            raise FileNotFoundError(f"Model artifact does not exist: {model_path}")
-        try:
-            models[label] = RandomForestClassificationModel.load(model_path)
-        except Exception as exc:
-            raise ValueError(f"Could not load model for label {label!r} from {model_path}") from exc
-
+    labels = list(per_label_paths.keys())
+    models = load_trained_models(per_label_paths, model_type)
     return {
         "run_id": run_id,
-        "feature_set": metadata["feature_set"],
+        "exp_id": exp_id,
+        "model_type": model_type,
+        "model_manifest_path": manifest_path,
+        "feature_set": manifest["feature_set"],
         "threshold": threshold,
         "labels": labels,
         "models": models,
     }
 
 
-def validate_model_contracts(spark, manifest: dict, registry_paths: dict[str, str]) -> dict:
-    contracts = {"production": validate_model_run(spark, registry_paths, manifest["production_run_id"])}
+def validate_model_run(spark, run_id: str, model_config: dict) -> dict:
+    if not isinstance(model_config, dict):
+        raise ValueError(f"Batch manifest for run {run_id} missing model config; recreate the batch manifest from config YAML")
+    return _load_experiment_contract(spark, run_id, model_config)
+
+
+def validate_model_contracts(spark, manifest: dict) -> dict:
+    contracts = {
+        "production": validate_model_run(
+            spark,
+            manifest["production_run_id"],
+            manifest.get("production_model_config"),
+        )
+    }
     if manifest.get("candidate_run_id"):
-        contracts["candidate"] = validate_model_run(spark, registry_paths, manifest["candidate_run_id"])
+        contracts["candidate"] = validate_model_run(
+            spark,
+            manifest["candidate_run_id"],
+            manifest.get("candidate_model_config"),
+        )
         production_features = contracts["production"]["feature_set"]
         candidate_features = contracts["candidate"]["feature_set"]
         if candidate_features != production_features:
@@ -350,12 +434,11 @@ def publish_predictions(spark, predictions, published_path: str) -> None:
     logger.info("Merged batch predictions into %s", published_path)
 
 
-def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | None = None) -> str:
+def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | None = None, feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> str:
     from pyspark.sql import functions as F
 
-    manifest = load_or_create_manifest(spark, batch_id, canary_percentage, input_path)
-    registry_paths = load_registry_paths()
-    contracts = validate_model_contracts(spark, manifest, registry_paths)
+    manifest = load_or_create_manifest(spark, batch_id, canary_percentage, input_path, feature_config_path)
+    contracts = validate_model_contracts(spark, manifest)
 
     if "input_version" not in manifest:
         logger.warning(
@@ -407,12 +490,12 @@ def run_batch(spark, batch_id: str, canary_percentage: float, input_path: str | 
     predictions.write.format("delta").mode("overwrite").save(manifest["predictions_path"])
     published_path = manifest.get(
         "published_predictions_path",
-        load_paths()["published_predictions"],
+        load_paths(feature_config_path)["published_predictions"],
     )
     publish_predictions(spark, predictions, published_path)
     validation_path = manifest.get(
         "validation_path",
-        f"{load_paths()['output']}/{batch_id}/validation.json",
+        f"{load_paths(feature_config_path)['output']}/{batch_id}/validation.json",
     )
     write_json(spark, validation_path, validation, overwrite=True)
     logger.info("Wrote predictions to %s", manifest["predictions_path"])
@@ -426,6 +509,7 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--canary-percentage", type=float, default=10.0)
+    parser.add_argument("--feature-config", default=str(DEFAULT_FEATURE_CONFIG_PATH))
     parser.add_argument("--input-path")
     args = parser.parse_args()
 
@@ -444,6 +528,7 @@ def main() -> None:
             args.batch_id,
             args.canary_percentage,
             args.input_path,
+            args.feature_config,
         )
         print(json.dumps({"published_predictions_path": published_path}, indent=2))
     finally:

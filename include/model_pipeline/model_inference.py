@@ -1,54 +1,27 @@
 """Holdout inference and evaluation for trained multi-label models."""
-from __future__ import annotations
 
 import argparse
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from model_pipeline import cli as pipeline_cli
 from model_pipeline.multilabel_core import (
-    DEFAULT_THRESHOLD_SWEEP,
-    DOCUMENT_ID_COL,
-    FEATURES_COL,
-    PREDICT_STAGE_ALL_DEPRECATED_MSG,
-    SPLIT_COL,
-    TARGET_LABELS_COL,
-    _compute_feature_importance_for_run,
-    _default_hyperparameters,
-    _feature_components,
-    _feature_importance_json_exists,
-    _hadoop_path_exists,
-    _load_checkpointed_predictions,
-    checkpoint_predictions,
-    compute_threshold_sweep,
-    create_pipeline_spark_session,
-    evaluate_multilabel,
-    load_features,
-    load_pickle,
-    load_schema_paths,
-    load_trained_models,
-    load_training_manifest,
-    load_dcw_vocab,
-    logger,
-    model_bank_feature_importance_path,
-    parse_threshold_sweep_values,
-    predict_multilabel,
-    prepare_holdout_data,
-    print_dry_run_summary,
-    prob_columns_in_df,
-    resolve_model_type_for_run,
-    resolve_prediction_exp_id,
-    save_evaluation_outputs,
-    save_holdout_features,
-    save_json,
-    save_pickle,
-    save_threshold_sweep_outputs,
-    prediction_delta_path,
-    _read_delta,
-    build_feature_column,
-)
-from model_pipeline.multilabel_core import F
+    DOCUMENT_ID_COL, FEATURES_COL, PREDICT_STAGE_ALL_DEPRECATED_MSG, SPLIT_COL,
+    TARGET_LABELS_COL, F, _compute_feature_importance_for_run,
+    _default_hyperparameters, _feature_components,
+    _feature_importance_json_exists, _hadoop_path_exists,
+    _load_checkpointed_predictions, _read_delta, build_feature_column,
+    checkpoint_predictions, compute_threshold_sweep,
+    create_pipeline_spark_session, evaluate_multilabel, load_dcw_vocab,
+    load_features, load_pickle, load_trained_models, load_training_manifest,
+    logger, model_bank_feature_importance_path, parse_threshold_sweep_values,
+    predict_multilabel, prediction_delta_path, prepare_holdout_data,
+    print_dry_run_summary, prob_columns_in_df, resolve_model_type_for_run,
+    resolve_prediction_exp_id, save_evaluation_outputs, save_holdout_features,
+    save_json, save_pickle, save_threshold_sweep_outputs)
+from pandas import DataFrame
+
+
 def _load_predict_context(
     spark,
     run_id: str,
@@ -100,19 +73,9 @@ def _load_predict_context(
     )
 
 
-def _build_holdout_from_features(
-    spark,
-    paths: dict[str, str],
-    feature_set: str,
-    components: dict[str, bool],
-    *,
-    holdout_splits: list[str] | None,
-    limit: int | None,
-) -> DataFrame:
+def _build_holdout_from_features(spark, paths: dict[str, str], feature_set: str, components: dict[str, bool], *, holdout_splits: list[str] | None, limit: int | None) -> DataFrame:
     dcw_vocab = load_dcw_vocab(spark, paths) if components["dcw"] else None
-    _, holdout_features, labels, embeddings_df = load_features(
-        spark, paths, feature_set, include_holdout=True
-    )
+    _, holdout_features, labels, embeddings_df = load_features(spark, paths, feature_set, include_holdout=True)
     holdout_df = prepare_holdout_data(holdout_features, labels, embeddings_df)
 
     if holdout_splits:
@@ -126,23 +89,14 @@ def _build_holdout_from_features(
     return build_feature_column(holdout_df, feature_set, dcw_vocab=dcw_vocab)
 
 
-def _load_saved_holdout_x(
-    spark,
-    paths: dict[str, str],
-    *,
-    holdout_splits: list[str] | None,
-    limit: int | None,
-) -> DataFrame:
+def _load_saved_holdout_x(spark, paths: dict[str, str], *, holdout_splits: list[str] | None, limit: int | None) -> DataFrame:
     x_path = paths["X_val_test_oot"]
     logger.info("Loading saved holdout X from %s", x_path)
     holdout_df = _read_delta(spark, x_path, "X_val_test_oot")
     required = {DOCUMENT_ID_COL, SPLIT_COL, TARGET_LABELS_COL, FEATURES_COL}
     missing = required - set(holdout_df.columns)
     if missing:
-        raise ValueError(
-            f"X_val_test_oot at {x_path} missing columns {missing}. "
-            "Run --predict-stage features first."
-        )
+        raise ValueError(f"X_val_test_oot at {x_path} missing columns {missing}. " "Run --predict-stage features first.")
 
     if holdout_splits:
         holdout_df = holdout_df.filter(F.col(SPLIT_COL).isin(holdout_splits))
@@ -156,15 +110,7 @@ def _load_saved_holdout_x(
 
 
 def _dry_run_holdout_eval_summary(
-    run_id: str,
-    args: argparse.Namespace,
-    components: dict[str, bool],
-    label_list: list[str],
-    predictions: DataFrame,
-    manifest: dict[str, Any],
-    model_type: str,
-    *,
-    holdout_df: DataFrame | None = None,
+    run_id: str, args: argparse.Namespace, components: dict[str, bool], label_list: list[str], predictions: DataFrame, manifest: dict[str, Any], model_type: str, *, holdout_df: DataFrame | None = None
 ) -> None:
     metrics = evaluate_multilabel(predictions, label_list)
     print_dry_run_summary(
@@ -180,13 +126,7 @@ def _dry_run_holdout_eval_summary(
     )
 
 
-def run_predict_stage_features(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
+def run_predict_stage_features(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
     components = _feature_components(args.feature_set)
     logger.info(
         "Predict stage=features: assembling holdout X (feature_set=%s)",
@@ -210,16 +150,8 @@ def run_predict_stage_features(
     logger.info("Predict stage=features complete: %s", paths["X_val_test_oot"])
 
 
-def run_predict_stage_predict(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, manifest_path, per_label_paths, feature_set, components, threshold, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
+def run_predict_stage_predict(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
+    manifest, manifest_path, per_label_paths, feature_set, components, threshold, label_list, model_type = _load_predict_context(spark, run_id, paths, args)
     logger.info(
         "Predict stage=predict: scoring %s labels from saved holdout X",
         f"{len(label_list):,}",
@@ -241,7 +173,13 @@ def run_predict_stage_predict(
 
     if args.dry_run:
         _dry_run_holdout_eval_summary(
-            run_id, args, components, label_list, predictions, manifest, model_type,
+            run_id,
+            args,
+            components,
+            label_list,
+            predictions,
+            manifest,
+            model_type,
             holdout_df=holdout_df,
         )
         return
@@ -268,23 +206,19 @@ def run_predict_stage_predict(
     )
 
 
-def run_predict_stage_metrics(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, manifest_path, _, feature_set, components, threshold, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
-    predictions, pred_delta_path, prediction_ts = _load_checkpointed_predictions(
-        spark, args, label_list
-    )
+def run_predict_stage_metrics(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
+    manifest, manifest_path, _, feature_set, components, threshold, label_list, model_type = _load_predict_context(spark, run_id, paths, args)
+    predictions, pred_delta_path, prediction_ts = _load_checkpointed_predictions(spark, args, label_list)
 
     if args.dry_run:
         _dry_run_holdout_eval_summary(
-            run_id, args, components, label_list, predictions, manifest, model_type,
+            run_id,
+            args,
+            components,
+            label_list,
+            predictions,
+            manifest,
+            model_type,
         )
         return
 
@@ -309,19 +243,9 @@ def run_predict_stage_metrics(
     logger.info("Predict stage=metrics complete")
 
 
-def run_predict_stage_threshold_sweep(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
-    manifest, _, _, feature_set, components, _, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
-    predictions, pred_delta_path, prediction_ts = _load_checkpointed_predictions(
-        spark, args, label_list
-    )
+def run_predict_stage_threshold_sweep(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
+    manifest, _, _, feature_set, components, _, label_list, model_type = _load_predict_context(spark, run_id, paths, args)
+    predictions, pred_delta_path, prediction_ts = _load_checkpointed_predictions(spark, args, label_list)
     thresholds = parse_threshold_sweep_values(args.threshold_sweep)
 
     if args.dry_run:
@@ -358,13 +282,7 @@ def run_predict_stage_threshold_sweep(
     logger.info("Predict stage=threshold_sweep complete")
 
 
-def run_backfill_feature_importance(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
+def run_backfill_feature_importance(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
     existing_path = _feature_importance_json_exists(spark, run_id)
     if existing_path and not args.force_feature_importance:
         logger.info("Feature importance already exists: %s (use --force-feature-importance to overwrite)", existing_path)
@@ -374,9 +292,7 @@ def run_backfill_feature_importance(
         logger.info("Skipping feature importance backfill (--feature-importance-top-k 0)")
         return
 
-    manifest, manifest_path, per_label_paths, feature_set, components, _, label_list, model_type = (
-        _load_predict_context(spark, run_id, paths, args)
-    )
+    manifest, manifest_path, per_label_paths, feature_set, components, _, label_list, model_type = _load_predict_context(spark, run_id, paths, args)
     models = load_trained_models(per_label_paths, model_type)
 
     feature_importance = _compute_feature_importance_for_run(
@@ -415,13 +331,7 @@ def run_backfill_feature_importance(
             logger.warning("Could not update training manifest with FI path: %s", exc)
 
 
-def run_predict_stage_eval(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
+def run_predict_stage_eval(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
     """Save holdout metrics manifest, threshold sweep, and feature importance (if missing)."""
     logger.info("Predict stage=eval: metrics + threshold_sweep + feature_importance")
     run_predict_stage_metrics(spark, run_id, feature_run_id, paths, args)
@@ -430,32 +340,18 @@ def run_predict_stage_eval(
     logger.info("Predict stage=eval complete for exp_id=%s", run_id)
 
 
-def run_predict_all(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
+def run_predict_all(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
     """Deprecated one-shot holdout pipeline. Delegates to features → predict → eval."""
     logger.warning(PREDICT_STAGE_ALL_DEPRECATED_MSG)
     run_predict_stage_features(spark, run_id, feature_run_id, paths, args)
     run_predict_stage_predict(spark, run_id, feature_run_id, paths, args)
     if args.dry_run:
-        logger.info(
-            "DRY RUN: skipping eval (predict stage did not checkpoint a prediction Delta)"
-        )
+        logger.info("DRY RUN: skipping eval (predict stage did not checkpoint a prediction Delta)")
         return
     run_predict_stage_eval(spark, run_id, feature_run_id, paths, args)
 
 
-def run_predict_only(
-    spark,
-    run_id: str,
-    feature_run_id: str,
-    paths: dict[str, str],
-    args: argparse.Namespace,
-) -> None:
+def run_predict_only(spark, run_id: str, feature_run_id: str, paths: dict[str, str], args: argparse.Namespace) -> None:
     stage = args.predict_stage
     if stage == "features":
         run_predict_stage_features(spark, run_id, feature_run_id, paths, args)
@@ -473,23 +369,20 @@ def run_predict_only(
         run_predict_all(spark, run_id, feature_run_id, paths, args)
 
 
-
 def main() -> None:
-    parser = pipeline_cli.build_parser(
-        description='Load saved models and evaluate val/test/oot holdout splits'
-    )
+    parser = pipeline_cli.build_parser(description="Load saved models and evaluate val/test/oot holdout splits")
     args = parser.parse_args()
     args.predict_only = True
     pipeline_cli.validate_inference_args(parser, args)
     pipeline_cli.configure_logging(args)
 
     exp_id, feature_run_id, gold_run_id, paths, components = pipeline_cli.resolve_run_context(args)
-    pipeline_cli.log_run_banner(args, exp_id, feature_run_id, gold_run_id, mode='inference')
+    pipeline_cli.log_run_banner(args, exp_id, feature_run_id, gold_run_id, mode="inference")
 
-    spark = create_pipeline_spark_session('gold-model-inference')
+    spark = create_pipeline_spark_session("gold-model-inference")
     run_predict_only(spark, exp_id, feature_run_id, paths, args)
-    logger.info('Holdout pipeline complete for exp_id=%s (stage=%s)', exp_id, args.predict_stage)
+    logger.info("Holdout pipeline complete for exp_id=%s (stage=%s)", exp_id, args.predict_stage)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

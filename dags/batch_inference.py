@@ -36,21 +36,13 @@ with DAG(
     default_args=DEFAULT_ARGS,
     params={
         "canary_percentage": 5.0,
-        "feature_run_id": "run004",
-        "gold_run_id": "run004",
-        "feature_set": "tfidf_dcw",
+        "feature_config": "config/batch_inference.yaml",
         "input_path": "",
     },
 ):
     assemble_inference_features = DockerOperator(
         task_id="assemble_inference_features",
-        command=(
-            "python include/model_pipeline/assemble_inference_features.py "
-            "--batch-id {{ ds_nodash }} "
-            "--feature-run-id {{ params.feature_run_id }} "
-            "--gold-run-id {{ params.gold_run_id }} "
-            "--feature-set {{ params.feature_set }}"
-        ),
+        command=("python include/model_pipeline/assemble_inference_features.py " "--batch-id {{ ds_nodash }} " "--config {{ params.feature_config }}"),
         execution_timeout=datetime.timedelta(hours=4),
         **COMMON,
     )
@@ -61,10 +53,9 @@ with DAG(
             "python include/inference/batch_inference.py "
             "--batch-id {{ ds_nodash }} "
             "--canary-percentage {{ params.canary_percentage }} "
+            "--feature-config {{ params.feature_config }} "
             "{% if params.input_path %}"
             "--input-path '{{ params.input_path }}'"
-            "{% else %}"
-            "--input-path 's3a://cs611-project/gold/runs/{{ params.gold_run_id }}/X_unlabelled'"
             "{% endif %}"
         ),
         execution_timeout=datetime.timedelta(hours=4),
