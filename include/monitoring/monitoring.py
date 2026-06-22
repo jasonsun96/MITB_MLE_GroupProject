@@ -624,7 +624,7 @@ def load_t0_baseline(spark, paths: dict) -> dict:
     metrics_date = _parse_metrics_date(metrics_path)
     baseline_date = oot_date or metrics_date
     if oot_date:
-        logger.info("Using OOT label-store date %s for T=0 baseline plot anchor", oot_date)
+        logger.info("Resolved OOT label-store date %s for T=0 baseline metadata", oot_date)
 
     return {
         "exp_id": T0_EXP_ID,
@@ -632,9 +632,9 @@ def load_t0_baseline(spark, paths: dict) -> dict:
         "macro_f1": split_metrics["macro_f1"],
         "hamming_loss": split_metrics["hamming_loss"],
         "labels": labels,
-        # Use the OOT split's snapshot_date as the x-position of the T=0 anchor.
-        # The metrics file date is a model evaluation artifact timestamp and can be
-        # much later than backfilled production batches.
+        # Keep the OOT split's snapshot_date as baseline metadata. The metrics file
+        # date is a model evaluation artifact timestamp and can be much later than
+        # backfilled production batches.
         "date": baseline_date,
         # Feature run id (e.g. "run001") locates the model's gold/runs/{id}/dcw_train
         # table used as the CSI training baseline.
@@ -910,39 +910,8 @@ def _segments_by_run_id(series: list[dict]) -> list[list[dict]]:
     return segments
 
 
-def _prepend_t0(series: list[dict], baseline: dict | None, key: str):
-    """
-    Return (series_with_t0, t0_time) where the model's T=0 baseline is inserted as
-    the first vertex, sharing the first segment's run_id so the line stays
-    continuous. The T=0 x-position is the baseline's eval date, or one day before
-    the first live point if no date is available. Returns the series unchanged
-    (and t0_time=None) when there is no baseline value for this metric.
-    """
-    if not baseline or baseline.get(key) is None:
-        return list(series), None
-
-    first_run_id = series[0].get("run_id") if series else baseline.get("exp_id")
-    if baseline.get("date"):
-        t0_time = datetime.fromisoformat(baseline["date"])
-    elif series:
-        first_time = _point_time(series[0])
-        t0_time = (first_time - timedelta(days=1)) if first_time else None
-    else:
-        t0_time = None
-
-    t0_point = {
-        "monitored_at": t0_time.isoformat() if t0_time else baseline.get("date"),
-        "batch_id": None,
-        "run_id": first_run_id,
-        "macro_f1": baseline.get("macro_f1"),
-        "hamming_loss": baseline.get("hamming_loss"),
-    }
-    return [t0_point, *series], t0_time
-
-
 def build_performance_plot(
     series_by_model: dict[str, list[dict]],
-    baselines: dict[str, dict | None],
     batch_id: str,
     generated_at: str,
 ) -> bytes:
@@ -952,9 +921,6 @@ def build_performance_plot(
     series_by_model: {"production": [...], "shadow": [...]} time-sorted points, each
         {monitored_at, batch_id, run_id, macro_f1, hamming_loss}. The shadow series
         is empty (and no shadow line drawn) unless a shadow model is configured.
-    baselines: T=0 reference keyed by run_id, {run_id: {macro_f1, hamming_loss,
-        date}}. Each model version has its own baseline; when production is
-        promoted, the new model's segment restarts at its own T=0.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -976,24 +942,15 @@ def build_performance_plot(
         for low, high, gyr in bands:
             ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
 
-        # One line per model, broken at model swaps. Each segment is one model
-        # version and restarts at its own T=0 baseline (a new champion after a
-        # promotion has a fresh training baseline, not the old model's).
+        # One line per model, broken at model swaps.
         for model, raw_series in series_by_model.items():
             style = MODEL_STYLES[model]
             # Drop days missing this metric (e.g. no ground truth -> no macro_f1).
             series = [point for point in raw_series if point.get(key) is not None]
             segments = _segments_by_run_id(series)
-            if not segments and model == "production":
-                baseline = baselines.get(T0_EXP_ID)
-                if baseline and baseline.get(key) is not None:
-                    segments = [[{"run_id": T0_EXP_ID}]]
 
             for seg in segments:
-                run_id = seg[0].get("run_id")
-                seg_with_t0, t0_time = _prepend_t0(seg, baselines.get(run_id), key)
-
-                xs, ys = _timed_xy(seg_with_t0, key)
+                xs, ys = _timed_xy(seg, key)
                 if not xs:
                     continue
                 plotted_xs.extend(xs)
@@ -1003,14 +960,6 @@ def build_performance_plot(
                     linestyle=style["linestyle"], markersize=5, linewidth=1.6,
                     label=style["label"], zorder=3,
                 )
-
-                # Emphasise this segment's T=0 anchor with a star
-                if t0_time is not None:
-                    ax.scatter(
-                        [t0_time], [baselines[run_id][key]],
-                        marker="*", s=140, color=style["color"],
-                        edgecolor="white", linewidth=0.6, zorder=4,
-                    )
 
         ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
         ax.set_ylim(*ylim)
@@ -1029,6 +978,7 @@ def build_performance_plot(
             end = start + timedelta(days=2)
         axes[-1].set_xlim(start, end)
 
+    axes[-1].xaxis.set_major_locator(mdates.DayLocator(interval=1))
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate(rotation=30)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -1546,13 +1496,9 @@ def run_monitoring(
     # Trend plots: production champion (+ shadow line if configured) over time.
     current_point_time = _point_time({"batch_id": batch_id, "monitored_at": monitored_at})
     history = load_metric_history(spark, paths, cutoff_time=current_point_time)
-    # T=0 baselines keyed by run_id (each model version anchors its own segment).
-    # NOTE: only the current production model's baseline is loaded here; historical
-    # promoted segments won't get a T=0 star until per-run_id baseline loading is added.
-    baselines = {T0_EXP_ID: {"macro_f1": t0["macro_f1"], "hamming_loss": t0["hamming_loss"], "date": t0["date"]}}
 
     _safe_plot(spark, f"{base_dir}/performance.png",
-               lambda: build_performance_plot(history, baselines, batch_id, monitored_at))
+               lambda: build_performance_plot(history, batch_id, monitored_at))
     _safe_plot(spark, f"{base_dir}/stability.png",
                lambda: build_stability_plot(history, batch_id, monitored_at))
     if psi_result:
