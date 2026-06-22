@@ -52,16 +52,20 @@ Artifacts produced:
       production documents only.
 
   stability.png
-      Time-series plot of PSI (prediction drift) and CSI
-      (feature drift).
+      Time-series plot of PSI (prediction drift, worst label vs
+      train) and CSI (feature drift, worst of top-50 features).
 
   psi_distribution.png
-      Per-label expected-vs-actual predicted prevalence
-      comparison for the current batch.
+      Per-label expected-vs-actual predicted prevalence comparison
+      for the current batch; labels with 0 positives in the small
+      reviewed-GT sample get a low-confidence "⚠ 0/N reviewed" hint.
 
   psi_label_trends.png
-      Historical PSI trend for every label, overlaid on
-      one chart.
+      Historical PSI trend for every label, overlaid on one chart.
+
+  psi_label_trends_separate.png
+      The same per-label PSI trends, but one panel per label
+      (small-multiples grid).
 
   csi_distribution.png
       Baseline-vs-production feature distribution comparison
@@ -407,6 +411,40 @@ def compute_psi(baseline_counts: dict, production_counts: dict, label_list: list
     }
 
 
+# PSI × ground-truth context — ANNOTATION ONLY, never used to filter the score. PSI is
+# GT-free by design; the reviewed GT is just the 10% sample, far too small to conclude a
+# label is truly absent (a ~7%-prevalence label has a ~1-in-3 chance of 0 hits in only
+# 14 reviewed docs). Excluding on that basis could mask real drift, so we surface GT
+# support per label as a low-confidence hint on the distribution plot and stop there.
+PSI_GT_ABSENT = "absent_in_gt"     # 0 GT positives in the reviewed sample (LOW confidence)
+PSI_GT_PRESENT = "present_in_gt"   # ≥1 GT positive in the reviewed sample
+PSI_GT_UNKNOWN = "no_gt"           # no reviewed GT overlapped this batch
+
+
+def annotate_psi_gt_support(psi_result: dict, gt_support_by_label: dict[str, int] | None,
+                            reviewed_count: int | None = None) -> dict:
+    """
+    Enrich a compute_psi(...) result IN PLACE with per-label GT context for the
+    distribution plot's hint: each per-label entry gains gt_support (reviewed-sample
+    positive count, or None) and an attribution tag; the reviewed sample size is stored
+    so the hint can read "0 of N reviewed".
+
+    This is ANNOTATION ONLY — it does NOT change overall_psi / overall_gyr. PSI stays
+    GT-free: the 10% reviewed sample is too small to safely exclude a label from the
+    worst-PSI headline, which could otherwise hide a genuine model failure.
+    """
+    for label, detail in psi_result["per_label"].items():
+        if gt_support_by_label is None:
+            detail["gt_support"] = None
+            detail["attribution"] = PSI_GT_UNKNOWN
+        else:
+            support = int(gt_support_by_label.get(label, 0))
+            detail["gt_support"] = support
+            detail["attribution"] = PSI_GT_PRESENT if support > 0 else PSI_GT_ABSENT
+    psi_result["gt_reviewed_count"] = reviewed_count
+    return psi_result
+
+
 # ── CSI ingestion (covariate / feature stability) ──────────────────────────────
 #
 # CSI watches the production model's top-50 global features for distribution shift.
@@ -614,6 +652,7 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
     hamming_loss = float(np.mean(y_true != y_pred))
 
     per_label_f1: dict[str, float] = {}
+    per_label_support: dict[str, int] = {}  # GT positive count per label (reviewed sample)
     supported_f1s: list[float] = []
     for j, label in enumerate(label_list):
         support = int(np.sum(y_true[:, j] == 1))
@@ -624,6 +663,7 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
         per_label_f1[label] = round(f1, 6)
+        per_label_support[label] = support
         if support > 0:
             supported_f1s.append(f1)
 
@@ -634,6 +674,7 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
         "macro_f1": round(macro_f1, 6),
         "hamming_loss": round(hamming_loss, 6),
         "per_label_f1": per_label_f1,
+        "per_label_support": per_label_support,
     }
 
 
@@ -1084,13 +1125,6 @@ def build_performance_plot(
 # GYR zones for stability metrics (lower is better); same thresholds for PSI and CSI.
 STABILITY_BANDS = [(0.00, PSI_GREEN, "GREEN"), (PSI_GREEN, PSI_YELLOW, "YELLOW"), (PSI_YELLOW, 100.0, "RED")]
 
-# One subplot per stability metric: (point key, subplot title).
-STABILITY_METRICS = [
-    ("psi", "PSI — prediction stability (worst label vs train)"),
-    ("csi", "CSI — feature stability (worst of top-50 features vs train)"),
-]
-
-
 def build_stability_plot(
     series_by_model: dict[str, list[dict]],
     batch_id: str,
@@ -1100,10 +1134,11 @@ def build_stability_plot(
     Render the stability time-series (PSI on top, CSI below) as PNG bytes — same style
     as the performance plot but its own figure and no T=0 anchor (stability is a
     production-vs-baseline drift score that only exists once batches start; ≈0 = no
-    shift). One line per model, broken at model swaps.
+    shift). One line per model, broken at model swaps. PSI is GT-free (worst label vs
+    train predictions); CSI is the worst of the top-50 features.
 
     series_by_model: {"production": [...], "shadow": [...]} time-sorted points, each
-        carrying run_id, psi (overall worst-label PSI) and csi (overall worst-feature CSI).
+        carrying run_id, psi and csi (overall worst-label / worst-feature scores).
         Shadow only carries performance, so it has no PSI/CSI line here.
     """
     import matplotlib
@@ -1111,13 +1146,18 @@ def build_stability_plot(
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
+    metrics = [
+        ("psi", "PSI — prediction stability (worst label vs train)", "PSI"),
+        ("csi", "CSI — feature stability (worst of top-50 features vs train)", "CSI"),
+    ]
+
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
     fig.suptitle(
         f"Stability Monitoring — batch {batch_id}  ({generated_at[:19]} UTC)",
         fontsize=12, fontweight="bold",
     )
 
-    for ax, (key, title) in zip(axes, STABILITY_METRICS):
+    for ax, (key, title, ylabel) in zip(axes, metrics):
         y_max = PSI_YELLOW * 1.2  # keep GYR bands visible even when the metric is tiny
         for low, high, gyr in STABILITY_BANDS:
             ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
@@ -1139,7 +1179,7 @@ def build_stability_plot(
                 )
 
         ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
-        ax.set_ylabel(key.upper())
+        ax.set_ylabel(ylabel)
         ax.set_ylim(0, y_max * 1.1)
         ax.grid(True, axis="y", alpha=0.2)
 
@@ -1179,9 +1219,16 @@ def build_psi_distribution_plot(
     import matplotlib.pyplot as plt
 
     items = sorted(psi_result["per_label"].items(), key=lambda kv: kv[1]["psi"], reverse=True)
-    labels = [label for label, _ in items]
     expected = [v["expected_rate"] for _, v in items]
     actual = [v["actual_rate"] for _, v in items]
+    # Low-confidence hint: labels with 0 positives in the small reviewed-GT sample. This
+    # is a caveat for the analyst, NOT a basis for excluding the label (10% reviewed is
+    # too small to conclude a class is truly absent — see annotate_psi_gt_support).
+    reviewed_n = psi_result.get("gt_reviewed_count")
+    hint = f"⚠ 0/{reviewed_n} reviewed" if reviewed_n else "⚠ 0 reviewed"
+    absent_flags = [v.get("attribution") == PSI_GT_ABSENT for _, v in items]
+    labels = [f"{label}  {hint}" if absent else label
+              for (label, _), absent in zip(items, absent_flags)]
     n = len(labels)
 
     fig, ax = plt.subplots(figsize=(11, max(4.0, n * 0.42)))
@@ -1199,10 +1246,15 @@ def build_psi_distribution_plot(
 
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8.5)
+    for tick, absent in zip(ax.get_yticklabels(), absent_flags):
+        if absent:
+            tick.set_color("#B71C1C")  # GT-absent labels in red so they stand out
     ax.invert_yaxis()  # largest PSI contributor at the top
     ax.set_xlabel("Label prevalence (fraction of documents)", fontsize=9)
-    ax.set_title("Predicted-label prevalence: expected vs actual",
-                 fontsize=10, fontweight="bold", loc="left")
+    title = "Predicted-label prevalence: expected vs actual"
+    if any(absent_flags):
+        title += "   (⚠ = 0 in the small reviewed-GT sample — low-confidence hint, not excluded)"
+    ax.set_title(title, fontsize=10, fontweight="bold", loc="left")
     ax.grid(True, axis="x", alpha=0.2)
 
     legend_handles = [
@@ -1495,6 +1547,69 @@ def build_psi_label_trends_plot(
     return buffer.read()
 
 
+def build_psi_label_grid_plot(
+    label_history: dict[str, list[dict]],
+    label_list: list[str],
+    batch_id: str,
+    generated_at: str,
+) -> bytes:
+    """
+    A grid of mini PSI trends — one panel per label — so every label's prediction
+    drift over time is visible separately (the per-label counterpart to the single
+    aggregate PSI line on the stability plot, and the small-multiples version of the
+    overlaid psi_label_trends chart). Panels are in label_list order over the shared
+    GYR bands; labels without history are skipped.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    labels = [label for label in label_list if label_history.get(label)]
+    n = len(labels)
+    ncols = 5
+    nrows = math.ceil(n / ncols) if n else 1
+    color = MODEL_STYLES["production"]["color"]
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.4, nrows * 2.2), squeeze=False, sharex=True)
+    fig.suptitle(
+        f"PSI per label (trend) — all {n} labels — batch {batch_id}  ({generated_at[:19]} UTC)",
+        fontsize=12, fontweight="bold",
+    )
+
+    for idx, label in enumerate(labels):
+        ax = axes[idx // ncols][idx % ncols]
+        for low, high, gyr in STABILITY_BANDS:
+            ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
+
+        y_max = PSI_YELLOW * 1.2
+        for seg in _segments_by_run_id(label_history.get(label, [])):
+            xs, ys = _timed_xy(seg, "psi")
+            if not xs:
+                continue
+            if ys:
+                y_max = max(y_max, max(ys))
+            ax.plot(xs, ys, color=color, marker="o", markersize=2.5, linewidth=1.0, zorder=3)
+
+        ax.set_ylim(0, y_max * 1.1)
+        ax.set_title(label, fontsize=8)
+        ax.tick_params(labelsize=6)
+
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+
+    axes[-1][0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
+    fig.autofmt_xdate(rotation=45)
+    fig.supylabel("PSI vs train baseline (GYR bands 0.10 / 0.25)", fontsize=9)
+    fig.tight_layout(rect=[0.01, 0, 1, 0.96])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
 def write_bytes(spark, path: str, data: bytes) -> None:
     """Write raw bytes (e.g. a PNG) to a Hadoop/R2 path, overwriting if present."""
     jvm = spark.sparkContext._jvm
@@ -1543,6 +1658,7 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
     """
     labels = t0["labels"]
     block: dict = {"run_id": T0_EXP_ID}
+    performance = None
     psi_result = csi_result = csi_values = None
 
     # Performance (needs ground truth → reviewed 10% only)
@@ -1569,6 +1685,11 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
             load_production_prediction_counts(spark, paths, batch_id),
             labels,
         )
+        # Annotate per-label PSI with reviewed-GT context for the distribution hint
+        # (annotation only — PSI stays GT-free; see annotate_psi_gt_support).
+        gt_support = performance.get("per_label_support") if performance else None
+        reviewed = performance.get("reviewed_count") if performance else None
+        annotate_psi_gt_support(psi_result, gt_support, reviewed)
         block["psi"] = psi_result["overall_psi"]
         block["psi_gyr"] = psi_result["overall_gyr"]
         block["psi_per_label"] = psi_result["per_label"]
@@ -1655,12 +1776,14 @@ def run_monitoring(
         _safe_plot(spark, f"{base_dir}/psi_distribution.png",
                    lambda: build_psi_distribution_plot(psi_result, batch_id, monitored_at))
 
-        # Per-label PSI trends over time (this batch's per-label PSI is now in
-        # history): every label overlaid on one chart.
+        # Per-label PSI trends over time: all labels overlaid on one chart, plus a
+        # small-multiples grid with one panel per label (GT-free).
         psi_label_history = load_psi_label_history(spark, paths, cutoff_time=current_point_time)
         if psi_label_history:
             _safe_plot(spark, f"{base_dir}/psi_label_trends.png",
                        lambda: build_psi_label_trends_plot(psi_label_history, t0["labels"], batch_id, monitored_at))
+            _safe_plot(spark, f"{base_dir}/psi_label_trends_separate.png",
+                       lambda: build_psi_label_grid_plot(psi_label_history, t0["labels"], batch_id, monitored_at))
     if csi_result and csi_values:
         _safe_plot(spark, f"{base_dir}/csi_distribution.png",
                    lambda: build_csi_distribution_plot(
