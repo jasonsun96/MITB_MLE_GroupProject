@@ -59,6 +59,10 @@ Artifacts produced:
       Per-label expected-vs-actual predicted prevalence
       comparison for the current batch.
 
+  psi_label_trends.png
+      Historical PSI trend for every label, overlaid on
+      one chart.
+
   csi_distribution.png
       Baseline-vs-production feature distribution comparison
       for all monitored CSI features.
@@ -332,7 +336,8 @@ def load_production_prediction_counts(spark, paths: dict, batch_id: str) -> dict
 
 # PSI GYR thresholds (lower is better): GREEN < 0.10, YELLOW 0.10–0.25, RED > 0.25.
 PSI_GREEN, PSI_YELLOW = 0.10, 0.25
-# Floor for zero rates so ln(A/E) stays finite when a label is absent on one side.
+# Floor for zero rates so both logs stay finite when a label is always / never
+# predicted on one side (rates are clamped into [PSI_EPSILON, 1-PSI_EPSILON]).
 PSI_EPSILON = 1e-4
 
 
@@ -344,22 +349,37 @@ def _classify_lower_is_better(value: float, green: float, yellow: float) -> str:
     return "RED"
 
 
-def _one_bin_psi(actual_rate: float, expected_rate: float) -> float:
-    """One-bin PSI contribution for a single label's prevalence: (A-E)*ln(A/E)."""
-    a = max(actual_rate, PSI_EPSILON)
-    e = max(expected_rate, PSI_EPSILON)
-    return (a - e) * math.log(a / e)
+def _per_label_psi(actual_rate: float, expected_rate: float) -> float:
+    """
+    Two-bin (present/absent) PSI for a single label's predicted prevalence:
+
+        (A - E)·ln(A/E) + ((1-A) - (1-E))·ln((1-A)/(1-E))
+
+    Each label in a multi-label problem is its own binary variable, so scoring both
+    the present and absent bins makes this a true per-label PSI (comparable to the
+    GYR thresholds) rather than half a divergence. Rates are clamped to
+    [PSI_EPSILON, 1-PSI_EPSILON] so both logs stay finite when a label is always /
+    never predicted on one side.
+    """
+    a = min(max(actual_rate, PSI_EPSILON), 1.0 - PSI_EPSILON)
+    e = min(max(expected_rate, PSI_EPSILON), 1.0 - PSI_EPSILON)
+    present = (a - e) * math.log(a / e)
+    absent = ((1.0 - a) - (1.0 - e)) * math.log((1.0 - a) / (1.0 - e))
+    return present + absent
 
 
 def compute_psi(baseline_counts: dict, production_counts: dict, label_list: list[str]) -> dict:
     """
-    Per-label one-bin PSI summed into an overall score, comparing the production
-    model's predicted-label prevalence in production against its OOT baseline.
+    Per-label two-bin (present/absent) PSI over the model's full label universe, plus
+    an overall score. Each label is scored as its own binary distribution comparing
+    its predicted prevalence at baseline (the model's train predictions) against
+    production (this batch); see _per_label_psi.
 
-    Aligns both distributions to the model's full label universe (label_list) so a
-    label present on one side but not the other still contributes (epsilon-floored).
-    Overall PSI = sum of per-label contributions; GYR is applied to the overall.
-    Per-label GYR is included as a heuristic for *which* label is drifting.
+    Overall PSI = the worst (max) single-label PSI, so the GYR thresholds (0.10 / 0.25)
+    stay interpretable per label and the worst-drifting label drives the alert (this
+    mirrors compute_csi's max-over-features). per_label keeps every label's PSI + GYR +
+    the two rates for the distribution plot and drill-down. A label present on one side
+    but not the other still contributes (epsilon-clamped).
     """
     expected_total = baseline_counts.get("total") or 0
     actual_total = production_counts.get("total") or 0
@@ -371,8 +391,8 @@ def compute_psi(baseline_counts: dict, production_counts: dict, label_list: list
     for label in label_list:
         expected_rate = baseline_counts["counts"].get(label, 0) / expected_total
         actual_rate = production_counts["counts"].get(label, 0) / actual_total
-        psi = _one_bin_psi(actual_rate, expected_rate)
-        overall += psi
+        psi = _per_label_psi(actual_rate, expected_rate)
+        overall = max(overall, psi)
         per_label[label] = {
             "psi": round(psi, 6),
             "expected_rate": round(expected_rate, 6),
@@ -488,27 +508,38 @@ def load_csi_production_values(spark, paths: dict, batch_id: str, features: list
 CSI_GREEN, CSI_YELLOW = 0.10, 0.25
 CSI_BINS = 10
 CSI_EPSILON = 1e-4
+# A DCW weight at/below this is treated as "feature absent" (the map is sparse and a
+# missing key is coalesced to 0.0). Used to split the zero mass into its own bin.
+CSI_ZERO_EPS = 1e-12
 
 
 def _feature_csi(baseline_values: list[float], production_values: list[float], n_bins: int = CSI_BINS) -> float:
     """
-    CSI for one continuous feature: quantile-bin the baseline, score both sides into
-    those bins, then Σ (actual_frac - expected_frac) * ln(actual/expected).
+    CSI for one sparse DCW feature: bin the baseline, score both sides into those
+    bins, then Σ (actual_frac - expected_frac) * ln(actual/expected).
 
-    DCW features are sparse (mostly 0). If the baseline is constant (e.g. never fires
-    in OOT), quantile edges collapse, so we fall back to zero-vs-nonzero bins to still
-    catch a firing-rate shift. Returns 0.0 when there is nothing to compare.
+    DCW features are mostly 0, so quantiling the raw column puts ~every edge at 0 and
+    the bins collapse (drift becomes invisible). Instead we give the zero/absent mass
+    its OWN bin and quantile-bin only the NON-ZERO baseline values, so the score
+    captures both a firing-rate shift (mass moving in/out of the zero bin) and a
+    magnitude shift among the docs where the feature fires. Edges come only from the
+    baseline; production is scored into the same edges. When the baseline never fires,
+    falls back to a plain zero-vs-nonzero split. Returns 0.0 when there is nothing to
+    compare.
     """
     base = np.asarray(baseline_values, dtype=float)
     prod = np.asarray(production_values, dtype=float)
     if base.size == 0 or prod.size == 0:
         return 0.0
 
-    edges = np.unique(np.quantile(base, np.linspace(0.0, 1.0, n_bins + 1)))
-    if edges.size < 2:  # degenerate baseline (typically all-zero) → presence/absence bins
-        edges = np.array([-np.inf, 1e-12, np.inf])
+    nonzero = base[base > CSI_ZERO_EPS]
+    if nonzero.size == 0:  # baseline never fires → zero-vs-nonzero presence bins
+        edges = np.array([-np.inf, CSI_ZERO_EPS, np.inf])
     else:
-        edges[0], edges[-1] = -np.inf, np.inf  # capture production values outside the baseline range
+        # Interior decile cuts over the firing values only (drop the 0%/100% ends so
+        # the outer bins stay open), preceded by the zero bin and capped at +inf.
+        interior = np.unique(np.quantile(nonzero, np.linspace(0.0, 1.0, n_bins + 1)))[1:-1]
+        edges = np.unique(np.concatenate([[-np.inf, CSI_ZERO_EPS], interior, [np.inf]]))
 
     base_hist, _ = np.histogram(base, bins=edges)
     prod_hist, _ = np.histogram(prod, bins=edges)
@@ -566,14 +597,19 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
     y_pred = np.zeros((n_docs, n_labels), dtype=int)
 
     for i, row in enumerate(rows):
-        # Ground-truth labels: semicolon-delimited string (label_store format).
-        for label in {part.strip().lower() for part in (row["labels"] or "").split(";") if part.strip()}:
+        # Ground-truth labels: a delimited string. Split on comma/pipe/semicolon to
+        # match the model's training-time label parsing (_normalize_labels_udf in
+        # multilabel_core); GT uses comma-joined compounds (e.g. "Finance, Tax &
+        # Banking") that map to separate model labels, so a ';'-only split drops them.
+        for label in {part.strip().lower() for part in re.split(r"[,|;]", row["labels"] or "") if part.strip()}:
             if label in label_index:
                 y_true[i, label_index[label]] = 1
-        # Predicted labels: array<string>, already normalised to the model labels.
+        # Predicted labels: array<string>. Strip/lower to match the ground-truth and
+        # label_index normalisation, so casing/whitespace can never silently drop one.
         for label in (row["predicted_labels"] or []):
-            if label in label_index:
-                y_pred[i, label_index[label]] = 1
+            normalized = (label or "").strip().lower()
+            if normalized in label_index:
+                y_pred[i, label_index[normalized]] = 1
 
     hamming_loss = float(np.mean(y_true != y_pred))
 
@@ -815,6 +851,52 @@ def load_csi_feature_history(spark, paths: dict, model: str = "production", cuto
     return history
 
 
+def load_psi_label_history(spark, paths: dict, model: str = "production", cutoff_time: datetime | None = None) -> dict[str, list[dict]]:
+    """
+    Read back the PER-LABEL PSI over time from monitoring/{batch_id}/metrics.json
+    (block[model]["psi_per_label"]), so each label can be plotted as its own PSI
+    trend. Returns {label: [{monitored_at, batch_id, run_id, psi, gyr}, ...]} sorted
+    oldest-first. Empty when no history (or no PSI) exists yet.
+    """
+    monitoring_base = paths["monitoring_base"]
+    history: dict[str, list[dict]] = {}
+
+    for batch_dir in _list_hadoop_children(spark, monitoring_base):
+        metrics_path = f"{batch_dir.rstrip('/')}/metrics.json"
+        if not hadoop_path_exists(spark, metrics_path):
+            continue
+        try:
+            report = read_json(spark, metrics_path)
+        except Exception as exc:  # tolerate a single corrupt/partial file
+            logger.warning("Skipping unreadable monitoring file %s: %s", metrics_path, exc)
+            continue
+
+        block = report.get(model)
+        if not block:
+            continue
+        run_id = block.get("run_id")
+        batch_dir_name = Path(batch_dir.rstrip("/")).name
+        for label, detail in (block.get("psi_per_label") or {}).items():
+            if detail.get("psi") is None:
+                continue
+            point = {
+                "monitored_at": report.get("monitored_at"),
+                "batch_id": report.get("batch_id") or batch_dir_name,
+                "run_id": run_id,
+                "psi": detail["psi"],
+                "gyr": detail.get("gyr"),
+            }
+            point_time = _point_time(point)
+            if cutoff_time is not None and point_time is not None and point_time > cutoff_time:
+                continue
+            history.setdefault(label, []).append(point)
+
+    for label in history:
+        history[label].sort(key=lambda point: _point_time(point) or datetime.max)
+    logger.info("Loaded per-label PSI history for %d labels", len(history))
+    return history
+
+
 def _list_hadoop_children(spark, path: str) -> list[str]:
     """List immediate child paths of a Hadoop directory; empty if it does not exist."""
     jvm = spark.sparkContext._jvm
@@ -847,6 +929,13 @@ def _latest_prediction_metrics(spark, metrics_dir: str) -> str | None:
 # Green-Yellow-Red criteria). Bands apply to every model line identically; they
 # are not relative to any T=0 baseline.
 GYR_COLORS = {"GREEN": "#4CAF50", "YELLOW": "#FFC107", "RED": "#F44336"}
+
+# Flat colours for the per-batch distribution reference plots (psi_distribution.png /
+# csi_distribution*.png): baseline in grey, production in orange. GYR is deliberately
+# NOT shown on these raw distribution comparisons — the GYR call lives on the
+# trend/stability plots, not here.
+DIST_BASELINE_COLOR = "#9E9E9E"
+DIST_PRODUCTION_COLOR = "#FB8C00"
 
 # (low, high, gyr) shaded zones. Macro F1: higher is better; Hamming: lower is better.
 MACRO_F1_BANDS = [(0.00, 0.60, "RED"), (0.60, 0.65, "YELLOW"), (0.65, 1.01, "GREEN")]
@@ -997,8 +1086,8 @@ STABILITY_BANDS = [(0.00, PSI_GREEN, "GREEN"), (PSI_GREEN, PSI_YELLOW, "YELLOW")
 
 # One subplot per stability metric: (point key, subplot title).
 STABILITY_METRICS = [
-    ("psi", "PSI — prediction stability (label distribution vs OOT)"),
-    ("csi", "CSI — feature stability (worst of top-50 features vs OOT)"),
+    ("psi", "PSI — prediction stability (worst label vs train)"),
+    ("csi", "CSI — feature stability (worst of top-50 features vs train)"),
 ]
 
 
@@ -1014,7 +1103,7 @@ def build_stability_plot(
     shift). One line per model, broken at model swaps.
 
     series_by_model: {"production": [...], "shadow": [...]} time-sorted points, each
-        carrying run_id, psi (overall summed PSI) and csi (overall worst-feature CSI).
+        carrying run_id, psi (overall worst-label PSI) and csi (overall worst-feature CSI).
         Shadow only carries performance, so it has no PSI/CSI line here.
     """
     import matplotlib
@@ -1078,9 +1167,9 @@ def build_psi_distribution_plot(
 ) -> bytes:
     """
     Reference-only companion to the PSI trend: a grouped bar chart of each label's
-    prevalence, expected (OOT baseline) vs actual (this batch), so the shift behind
-    the PSI score is visible. Labels are ordered by PSI contribution (largest
-    movers on top); the actual bar is tinted by that label's GYR.
+    prevalence, expected (train baseline) vs actual (this batch), so the shift behind
+    the PSI score is visible. Labels are ordered by PSI (largest movers on top); the
+    actual bar is a flat orange (GYR lives on the trend plots, not here).
 
     psi_result: a compute_psi(...) output with a per_label block.
     """
@@ -1093,7 +1182,6 @@ def build_psi_distribution_plot(
     labels = [label for label, _ in items]
     expected = [v["expected_rate"] for _, v in items]
     actual = [v["actual_rate"] for _, v in items]
-    actual_colors = [GYR_COLORS[v["gyr"]] for _, v in items]
     n = len(labels)
 
     fig, ax = plt.subplots(figsize=(11, max(4.0, n * 0.42)))
@@ -1104,22 +1192,22 @@ def build_psi_distribution_plot(
 
     y = np.arange(n)
     bar_h = 0.4
-    ax.barh(y - bar_h / 2, expected, height=bar_h, color="#9E9E9E",
-            label="Expected (OOT baseline)", zorder=3)
-    ax.barh(y + bar_h / 2, actual, height=bar_h, color=actual_colors,
+    ax.barh(y - bar_h / 2, expected, height=bar_h, color=DIST_BASELINE_COLOR,
+            label="Expected (train baseline)", zorder=3)
+    ax.barh(y + bar_h / 2, actual, height=bar_h, color=DIST_PRODUCTION_COLOR,
             edgecolor="white", linewidth=0.4, label="Actual (this batch)", zorder=3)
 
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=8.5)
     ax.invert_yaxis()  # largest PSI contributor at the top
     ax.set_xlabel("Label prevalence (fraction of documents)", fontsize=9)
-    ax.set_title("Predicted-label prevalence: expected vs actual (actual tinted by GYR)",
+    ax.set_title("Predicted-label prevalence: expected vs actual",
                  fontsize=10, fontweight="bold", loc="left")
     ax.grid(True, axis="x", alpha=0.2)
 
     legend_handles = [
-        mpatches.Patch(color="#9E9E9E", label="Expected (OOT baseline)"),
-        mpatches.Patch(facecolor="white", edgecolor="#777", label="Actual (tinted GREEN/YELLOW/RED by PSI)"),
+        mpatches.Patch(color=DIST_BASELINE_COLOR, label="Expected (train baseline)"),
+        mpatches.Patch(color=DIST_PRODUCTION_COLOR, label="Actual (this batch)"),
     ]
     ax.legend(handles=legend_handles, fontsize=7.5, loc="lower right")
 
@@ -1141,15 +1229,15 @@ def build_csi_distribution_plot(
     top_n: int | None = None,
 ) -> bytes:
     """
-    Reference companion to the CSI trend: overlaid baseline (OOT) vs production value
+    Reference companion to the CSI trend: overlaid baseline (train) vs production value
     histograms per feature, so the distribution shift behind each CSI is visible.
 
     top_n=None  -> all features in a compact grid (the full top-50 reference).
     top_n=3     -> just the most globally important features, large (presentation).
 
-    Each panel is titled with the feature name + its CSI, and the production
-    histogram is tinted by that feature's GYR. features arrive in global-importance
-    order, so features[:top_n] are the top-N.
+    Each panel is titled with the feature name + its CSI; baseline is grey and
+    production is a flat orange (GYR lives on the trend plots, not here). features
+    arrive in global-importance order, so features[:top_n] are the top-N.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -1177,13 +1265,12 @@ def build_csi_distribution_plot(
         combined = np.concatenate([base, prod]) if base.size + prod.size else np.array([0.0, 1.0])
         lo, hi = float(combined.min()), float(combined.max())
         bins = np.linspace(lo, hi, 21) if hi > lo else np.linspace(lo - 0.5, lo + 0.5, 3)
-        actual_color = GYR_COLORS.get(detail.get("gyr", "GREEN"), MODEL_STYLES["production"]["color"])
 
         base_n = prod_n = None
         if base.size:
-            base_n, _, _ = ax.hist(base, bins=bins, density=True, color="#9E9E9E", alpha=0.55, label="Baseline (OOT)")
+            base_n, _, _ = ax.hist(base, bins=bins, density=True, color=DIST_BASELINE_COLOR, alpha=0.55, label="Baseline (train)")
         if prod.size:
-            prod_n, _, _ = ax.hist(prod, bins=bins, density=True, color=actual_color, alpha=0.55, label="Production")
+            prod_n, _, _ = ax.hist(prod, bins=bins, density=True, color=DIST_PRODUCTION_COLOR, alpha=0.55, label="Production")
 
         # The 0-bin (feature absent) dwarfs everything; cap the y-axis to the tallest
         # non-zero bin so the actual-value differences are visible. The 0 bar clips off.
@@ -1274,7 +1361,7 @@ def build_csi_feature_grid_plot(
 
     axes[-1][0].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
     fig.autofmt_xdate(rotation=45)
-    fig.supylabel("CSI (GYR bands 0.10 / 0.25)", fontsize=9)
+    fig.supylabel("CSI vs train baseline (GYR bands 0.10 / 0.25)", fontsize=9)
     fig.tight_layout(rect=[0.01, 0, 1, 0.96])
 
     buffer = io.BytesIO()
@@ -1328,7 +1415,7 @@ def build_csi_top_features_plot(
             )
             labelled = True
 
-    ax.set_title("Per-feature CSI vs OOT baseline", fontsize=10, fontweight="bold", loc="left")
+    ax.set_title("Per-feature CSI vs train baseline", fontsize=10, fontweight="bold", loc="left")
     ax.set_ylabel("CSI")
     ax.set_ylim(0, y_max * 1.1)
     ax.grid(True, axis="y", alpha=0.2)
@@ -1337,6 +1424,69 @@ def build_csi_top_features_plot(
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate(rotation=30)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def build_psi_label_trends_plot(
+    label_history: dict[str, list[dict]],
+    label_list: list[str],
+    batch_id: str,
+    generated_at: str,
+) -> bytes:
+    """
+    Every label's PSI trend overlaid on one chart — the per-label counterpart to the
+    single aggregate (worst-label) PSI line on the stability plot — so all labels can
+    be compared directly. One coloured line per label, broken at model swaps, over the
+    shared GYR bands. Labels are drawn in label_list order; any label without history
+    is skipped.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    labels = [label for label in label_list if label_history.get(label)]
+    cmap = plt.get_cmap("tab20")  # up to 20 distinct line colours
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    fig.suptitle(
+        f"PSI per label (trend) — all {len(labels)} labels — batch {batch_id}  ({generated_at[:19]} UTC)",
+        fontsize=12, fontweight="bold",
+    )
+
+    y_max = PSI_YELLOW * 1.2
+    for low, high, gyr in STABILITY_BANDS:
+        ax.axhspan(low, high, color=GYR_COLORS[gyr], alpha=0.12, zorder=0)
+
+    for index, label in enumerate(labels):
+        color = cmap(index % 20)
+        labelled = False
+        for seg in _segments_by_run_id(label_history.get(label, [])):
+            xs, ys = _timed_xy(seg, "psi")
+            if not xs:
+                continue
+            if ys:
+                y_max = max(y_max, max(ys))
+            ax.plot(
+                xs, ys, color=color, marker="o", markersize=4, linewidth=1.4,
+                label=label if not labelled else None, zorder=3,
+            )
+            labelled = True
+
+    ax.set_title("Per-label PSI vs train baseline", fontsize=10, fontweight="bold", loc="left")
+    ax.set_ylabel("PSI")
+    ax.set_ylim(0, y_max * 1.1)
+    ax.grid(True, axis="y", alpha=0.2)
+    # All labels (up to 15) -> legend outside the axes so it never covers the lines.
+    ax.legend(fontsize=7, loc="center left", bbox_to_anchor=(1.01, 0.5))
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate(rotation=30)
+    fig.tight_layout(rect=[0, 0, 0.84, 0.94])
 
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", dpi=120, bbox_inches="tight")
@@ -1504,6 +1654,13 @@ def run_monitoring(
     if psi_result:
         _safe_plot(spark, f"{base_dir}/psi_distribution.png",
                    lambda: build_psi_distribution_plot(psi_result, batch_id, monitored_at))
+
+        # Per-label PSI trends over time (this batch's per-label PSI is now in
+        # history): every label overlaid on one chart.
+        psi_label_history = load_psi_label_history(spark, paths, cutoff_time=current_point_time)
+        if psi_label_history:
+            _safe_plot(spark, f"{base_dir}/psi_label_trends.png",
+                       lambda: build_psi_label_trends_plot(psi_label_history, t0["labels"], batch_id, monitored_at))
     if csi_result and csi_values:
         _safe_plot(spark, f"{base_dir}/csi_distribution.png",
                    lambda: build_csi_distribution_plot(
