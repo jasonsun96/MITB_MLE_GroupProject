@@ -2,6 +2,7 @@ import datetime
 import os
 
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.sdk import DAG
 
 IMAGE_NAME = "document_topic_tagger"
@@ -18,24 +19,38 @@ COMMON = dict(
     environment=R2_ENV,
     auto_remove="force",
     docker_url="unix://var/run/docker.sock",
+    mount_tmp_dir=False,
 )
+
+DEFAULT_ARGS = {
+    "retries": 2,
+    "retry_delay": datetime.timedelta(minutes=1),
+}
+
+
+def should_run_wiki_branch(**context) -> bool:
+    run_wiki = context["params"].get("run_wiki", True)
+    if isinstance(run_wiki, str):
+        return run_wiki.strip().lower() not in {"0", "false", "f", "no", "n", "off"}
+
+    return bool(run_wiki)
+
 
 with DAG(
     dag_id="medallion_pipeline",
-    start_date=datetime.datetime(2005, 1, 1),
-    end_date=datetime.datetime(2005, 12, 31),
+    start_date=datetime.datetime(2027, 1, 1),
     schedule="@daily",
+    max_active_runs=1,
     catchup=False,
+    default_args=DEFAULT_ARGS,
+    params={
+        "run_wiki": True,
+    },
 ):
     # ---- bronze ----
     bronze_ingest = DockerOperator(
         task_id="ingest_bronze",
-        command=(
-            "python include/bronze/ingest_bronze.py "
-            "--start-date {{ ds }} "
-            "--end-date {{ ds }} "
-            "--batch-id {{ ds_nodash }}"
-        ),
+        command=("python include/bronze/ingest_bronze.py " "--start-date {{ ds }} " "--end-date {{ ds }} " "--batch-id {{ ds_nodash }}"),
         **COMMON,
     )
 
@@ -44,6 +59,11 @@ with DAG(
         task_id="process_silver_legal_docs",
         command="python include/silver/process_legal_docs.py --snapshot-date {{ ds }}",
         **COMMON,
+    )
+
+    run_wiki_branch = ShortCircuitOperator(
+        task_id="should_run_wiki_branch",
+        python_callable=should_run_wiki_branch,
     )
 
     silver_wiki = DockerOperator(
@@ -92,7 +112,8 @@ with DAG(
 
     # ---- dependencies ----
     # gold jobs read SILVER tables, so they must run after their silver task
-    bronze_ingest >> [silver_legal, silver_wiki]
+    bronze_ingest >> [silver_legal, run_wiki_branch]
+    run_wiki_branch >> silver_wiki
     silver_legal >> [build_label_store, gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
     silver_wiki >> [gold_pos_counts_wiki, gold_wiki_embeddings]
 

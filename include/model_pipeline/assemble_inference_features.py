@@ -161,11 +161,20 @@ def resolve_feature_assembly_contexts(spark, args: argparse.Namespace) -> list[d
     if not isinstance(feature_config, dict):
         raise ValueError("Feature assembly config field 'features' must be a mapping")
 
-    category = _clean_optional(feature_config.get("category")) or _clean_optional(args.category) or DEFAULT_INFERENCE_CATEGORY
-    return [
+    categories = feature_config.get("categories")
+    if categories is not None:
+        if not isinstance(categories, list) or not all(_clean_optional(category) for category in categories):
+            raise ValueError("Feature assembly config field 'features.categories' must be a non-empty list of category names")
+        resolved_categories = [_clean_optional(category) for category in categories]
+    else:
+        resolved_categories = [_clean_optional(feature_config.get("category")) or _clean_optional(args.category) or DEFAULT_INFERENCE_CATEGORY]
+
+    contexts = [
         _resolve_model_context(spark, alias, model_config, feature_config, category)
         for alias, model_config in _deployment_model_configs(config)
+        for category in resolved_categories
     ]
+    return contexts
 
 
 def load_batch_feature_base(config_path: str | Path | None, batch_id: str) -> str:
@@ -225,24 +234,45 @@ def add_dcw_features_column(df: DataFrame, score: dict[str, float]) -> DataFrame
     return df.withColumn(DCW_FEATURES_COL, compute_dcw_map(F.col("pos_counts")))
 
 
+def _snapshot_date_from_batch_id(batch_id: str) -> str:
+    try:
+        return datetime.strptime(batch_id, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(
+            "labels table has no batch_id column, so --batch-id must be YYYYMMDD "
+            f"to filter by snapshot_date; got {batch_id!r}"
+        ) from exc
+
+
 def _load_inference_ids(spark, labels_path: str, category: str, batch_id: str) -> DataFrame:
     labels = spark.read.format("delta").load(labels_path)
-    required = {DOCUMENT_ID_COL, SPLIT_COL, "batch_id"}
+    required = {DOCUMENT_ID_COL, SPLIT_COL}
     missing = required - set(labels.columns)
     if missing:
         raise ValueError(f"labels table missing required columns: {sorted(missing)}")
 
-    df = labels.filter((F.col(SPLIT_COL) == category) & (F.col("batch_id") == batch_id))
+    df = labels.filter(F.col(SPLIT_COL) == category)
+    if "batch_id" in labels.columns:
+        df = df.filter(F.col("batch_id") == batch_id)
+        batch_filter = f"batch_id={batch_id!r}"
+    elif "snapshot_date" in labels.columns:
+        snapshot_date = _snapshot_date_from_batch_id(batch_id)
+        df = df.filter(F.col("snapshot_date") == snapshot_date)
+        batch_filter = f"snapshot_date={snapshot_date!r}"
+        logger.info("labels table has no batch_id column; filtering inference ids by %s", batch_filter)
+    else:
+        raise ValueError("labels table must contain either batch_id or snapshot_date")
 
     select_cols = [DOCUMENT_ID_COL, SPLIT_COL]
     if "snapshot_date" in df.columns:
         select_cols.append("snapshot_date")
-    select_cols.append("batch_id")
+    if "batch_id" in df.columns:
+        select_cols.append("batch_id")
 
     ids = df.select(*select_cols).dropDuplicates([DOCUMENT_ID_COL])
     count = ids.count()
     if count == 0:
-        raise ValueError(f"No documents found with category={category!r} and batch_id={batch_id!r}")
+        raise ValueError(f"No documents found with category={category!r} and {batch_filter}")
     logger.info("Loaded %s inference document ids", f"{count:,}")
     return ids
 
@@ -321,12 +351,14 @@ def assemble_inference_features(spark, paths: dict[str, str], *, feature_set: st
     return output
 
 
-def write_inference_features(df: DataFrame, path: str, batch_id: str | None) -> None:
+def write_inference_features(df: DataFrame, path: str, batch_id: str | None, mode: str = "overwrite") -> None:
     writer = df.write.format("delta").option("mergeSchema", "true")
-    if batch_id and "batch_id" in df.columns:
+    if mode == "overwrite" and batch_id and "batch_id" in df.columns:
         (writer.mode("overwrite").partitionBy("batch_id").option("replaceWhere", f"batch_id = '{batch_id}'").save(path))
-    else:
+    elif mode == "overwrite":
         writer.mode("overwrite").save(path)
+    else:
+        writer.mode(mode).save(path)
     logger.info("Wrote inference features to %s", path)
 
 
@@ -349,27 +381,36 @@ def main() -> None:
     try:
         contexts = resolve_feature_assembly_contexts(spark, args)
         feature_base = load_batch_feature_base(args.config, args.batch_id)
+        contexts_by_alias: dict[str, list[dict[str, Any]]] = {}
         for context in contexts:
-            paths = load_schema_paths(context["feature_run_id"], gold_run_id=context["gold_run_id"])
-            output_path = f"{feature_base}/{context['alias']}"
-            logger.info("Deployment group: %s", context["alias"])
-            logger.info("Model exp_id: %s", context.get("exp_id") or "<manual>")
-            logger.info("Model manifest: %s", context.get("model_manifest_path") or "<none>")
-            logger.info("Feature run: %s", context["feature_run_id"])
-            logger.info("Feature set: %s", context["feature_set"])
-            logger.info("Gold run: %s", context["gold_run_id"])
-            logger.info("Output inference features: %s", output_path)
+            contexts_by_alias.setdefault(context["alias"], []).append(context)
 
-            output = assemble_inference_features(
-                spark,
-                paths,
-                feature_set=context["feature_set"],
-                category=context["category"],
-                batch_id=args.batch_id,
-                limit=args.limit,
-                model_context=context,
-            ).withColumn("deployment_group", F.lit(context["alias"]))
-            write_inference_features(output, output_path, args.batch_id)
+        for alias, alias_contexts in contexts_by_alias.items():
+            output_path = f"{feature_base}/{alias}"
+            for index, context in enumerate(alias_contexts):
+                paths = load_schema_paths(context["feature_run_id"], gold_run_id=context["gold_run_id"])
+                logger.info("Deployment group: %s", alias)
+                logger.info("Model exp_id: %s", context.get("exp_id") or "<manual>")
+                logger.info("Model manifest: %s", context.get("model_manifest_path") or "<none>")
+                logger.info("Feature run: %s", context["feature_run_id"])
+                logger.info("Feature set: %s", context["feature_set"])
+                logger.info("Gold run: %s", context["gold_run_id"])
+                logger.info("Label category: %s", context["category"])
+                logger.info("Output inference features: %s", output_path)
+
+                output = (
+                    assemble_inference_features(
+                        spark,
+                        paths,
+                        feature_set=context["feature_set"],
+                        category=context["category"],
+                        batch_id=args.batch_id,
+                        limit=args.limit,
+                        model_context=context,
+                    ).withColumn("deployment_group", F.lit(alias))
+                )
+                write_mode = "overwrite" if index == 0 else "append"
+                write_inference_features(output, output_path, args.batch_id, mode=write_mode)
     finally:
         spark.stop()
 

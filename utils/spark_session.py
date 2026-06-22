@@ -25,6 +25,7 @@ _JVM_OPENS = " ".join(
 )
 
 _DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "4g")
+_DEFAULT_SPARK_MASTER = "local[*,4]"
 
 os.environ["PYSPARK_SUBMIT_ARGS"] = f"--driver-memory {_DRIVER_MEMORY} " f"--driver-java-options='{_JVM_OPENS}' " f"--conf spark.executor.extraJavaOptions='{_JVM_OPENS}' " "pyspark-shell"
 
@@ -35,13 +36,17 @@ def create_spark_session(app_name, log_level="ERROR"):
     SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
     R2_ENDPOINT = f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-    master = os.environ.get("SPARK_MASTER", "local[*]")
+    master = os.environ.get("SPARK_MASTER", _DEFAULT_SPARK_MASTER)
 
     builder = (
         SparkSession.builder.appName(app_name)
         .master(master)
         .config("spark.driver.extraJavaOptions", _JVM_OPENS)
         .config("spark.executor.extraJavaOptions", _JVM_OPENS)
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.ui.retainedExecutions", "10")
+        .config("spark.ui.retainedJobs", "10")
+        .config("spark.ui.retainedStages", "10")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.hadoop.fs.s3a.endpoint", R2_ENDPOINT)
@@ -49,6 +54,10 @@ def create_spark_session(app_name, log_level="ERROR"):
         .config("spark.hadoop.fs.s3a.secret.key", SECRET_ACCESS_KEY)
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.attempts.maximum", "10")
+        .config("spark.hadoop.fs.s3a.retry.limit", "10")
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "30000")
+        .config("spark.hadoop.fs.s3a.connection.timeout", "120000")
     )
     spark = configure_spark_with_delta_pip(
         builder,

@@ -180,6 +180,10 @@ def main():
 
     input_count = df.count()
     logger.info(f"Processing {input_count:,} documents across " f"{df.rdd.getNumPartitions()} partitions")
+    if input_count == 0:
+        logger.info("No documents matched POS-count filters; skipping write to %s", OUTPUT_PATH)
+        spark.stop()
+        return
 
     # run the udf, then flatten the struct cols back to top-level
     result = df.withColumn("_pos", extract_pos_counts_udf(F.col("text"))).select(

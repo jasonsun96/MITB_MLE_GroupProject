@@ -106,10 +106,9 @@ T0_EXP_ID = "exp004_LR_tfidf_dcw_gs"
 # closest training-time analogue to future production data (see design notes).
 T0_METRICS_SPLIT = "holdout_oot"
 
-# Documents reviewed by lawyers (the 10% with ground truth) are written back to
-# label_store tagged with this category. [Assumption: ground-truth ingestion
-# appends reviewed production docs to label_store with category='production'.]
-REVIEWED_CATEGORY = "production"
+# Production documents with ground-truth labels are written to label_store with
+# this category. Monitoring evaluates performance only on this labelled subset.
+REVIEWED_CATEGORY = "production_labelled"
 
 # Optional SHADOW model: a second model scored alongside production for comparison
 # (exploratory). When set, its performance is plotted as a separate line on the
@@ -199,8 +198,8 @@ def load_paths(
     model_bank_base = schema["model_bank"]["path"].rstrip("/")
     return {
         "gold_base": gold_base,
-        # Ground-truth labels for the reviewed 10% (label_store, filtered to
-        # category='production'). 'labels' is an alias to this path.
+        # Ground-truth labels for the reviewed production subset (label_store,
+        # filtered to category='production_labelled'). 'labels' is an alias to this path.
         "label_store": _join_storage_path(gold_base, str(label_store_path)),
         # Served predictions; the reviewed 10% are a subset of each batch.
         "published_predictions": _join_storage_path(gold_base, str(published_predictions_path)),
@@ -551,9 +550,9 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
     Compute live Macro F1 (P0) and Hamming Loss (P1) for one batch on the reviewed
     10%, by joining ground truth with predictions on document_id.
 
-    Macro F1 is averaged over `label_list` (the production model's label universe)
-    so it is directly comparable to the T=0 baseline. Returns None when no reviewed
-    documents overlap this batch (nothing to score).
+    Macro F1 is averaged over labels with at least one ground-truth positive in
+    the reviewed batch. Returns None when no reviewed documents overlap this
+    batch (nothing to score).
     """
     joined = ground_truth_df.join(predictions_df, on="document_id", how="inner")
     rows = joined.select("labels", "predicted_labels").collect()
@@ -579,7 +578,9 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
     hamming_loss = float(np.mean(y_true != y_pred))
 
     per_label_f1: dict[str, float] = {}
+    supported_f1s: list[float] = []
     for j, label in enumerate(label_list):
+        support = int(np.sum(y_true[:, j] == 1))
         tp = int(np.sum((y_true[:, j] == 1) & (y_pred[:, j] == 1)))
         fp = int(np.sum((y_true[:, j] == 0) & (y_pred[:, j] == 1)))
         fn = int(np.sum((y_true[:, j] == 1) & (y_pred[:, j] == 0)))
@@ -587,10 +588,13 @@ def compute_performance(ground_truth_df, predictions_df, label_list: list[str]) 
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
         per_label_f1[label] = round(f1, 6)
+        if support > 0:
+            supported_f1s.append(f1)
 
-    macro_f1 = float(np.mean(list(per_label_f1.values())))
+    macro_f1 = float(np.mean(supported_f1s)) if supported_f1s else 0.0
     return {
         "reviewed_count": n_docs,
+        "supported_label_count": len(supported_f1s),
         "macro_f1": round(macro_f1, 6),
         "hamming_loss": round(hamming_loss, 6),
         "per_label_f1": per_label_f1,
@@ -616,19 +620,46 @@ def load_t0_baseline(spark, paths: dict) -> dict:
     # The model's canonical label set defines the universe over which Macro F1 is
     # averaged. Live metrics must use this same set to be comparable to the baseline.
     labels = sorted(metrics["probability_columns"].keys())
+    oot_date = _max_oot_snapshot_date(spark, paths)
+    metrics_date = _parse_metrics_date(metrics_path)
+    baseline_date = oot_date or metrics_date
+    if oot_date:
+        logger.info("Using OOT label-store date %s for T=0 baseline plot anchor", oot_date)
+
     return {
         "exp_id": T0_EXP_ID,
         "split": T0_METRICS_SPLIT,
         "macro_f1": split_metrics["macro_f1"],
         "hamming_loss": split_metrics["hamming_loss"],
         "labels": labels,
-        # Evaluation date (from the prediction_YYYYMMDD filename) becomes the
-        # x-position of the T=0 point that anchors the start of the model's line.
-        "date": _parse_metrics_date(metrics_path),
+        # Use the OOT split's snapshot_date as the x-position of the T=0 anchor.
+        # The metrics file date is a model evaluation artifact timestamp and can be
+        # much later than backfilled production batches.
+        "date": baseline_date,
         # Feature run id (e.g. "run001") locates the model's gold/runs/{id}/dcw_train
         # table used as the CSI training baseline.
         "feature_run_id": metrics.get("feature_run_id"),
     }
+
+
+def _max_oot_snapshot_date(spark, paths: dict) -> str | None:
+    """Return the latest label_store snapshot_date for the OOT split."""
+    from pyspark.sql import functions as F
+
+    try:
+        label_store = spark.read.format("delta").load(paths["label_store"])
+        if "category" not in label_store.columns or "snapshot_date" not in label_store.columns:
+            return None
+        row = (
+            label_store.filter(F.col("category") == "oot")
+            .agg(F.max(F.to_date(F.col("snapshot_date"))).alias("max_oot_date"))
+            .first()
+        )
+        value = row["max_oot_date"] if row else None
+        return value.isoformat() if value else None
+    except Exception as exc:
+        logger.warning("Could not resolve OOT baseline date from label_store: %s", exc)
+        return None
 
 
 def _parse_metrics_date(metrics_path: str) -> str | None:
@@ -690,7 +721,7 @@ TRACKED_MODELS = ("production", "shadow")
 TRACKED_METRICS = ("macro_f1", "hamming_loss", "psi", "csi")
 
 
-def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
+def load_metric_history(spark, paths: dict, cutoff_time: datetime | None = None) -> dict[str, list[dict]]:
     """
     Read back prior runs' metric points from monitoring/{batch_id}/metrics.json so
     each daily run can plot time-series lines (performance and PSI) rather than dots.
@@ -719,23 +750,26 @@ def load_metric_history(spark, paths: dict) -> dict[str, list[dict]]:
             block = report.get(model)
             if not block or not block.get("run_id"):  # model absent that day
                 continue
+            batch_dir_name = Path(batch_dir.rstrip("/")).name
             point = {
-                "batch_id": report.get("batch_id"),
+                "batch_id": report.get("batch_id") or batch_dir_name,
                 "monitored_at": report.get("monitored_at"),
                 "run_id": block.get("run_id"),
             }
             point.update({metric: block.get(metric) for metric in TRACKED_METRICS})
+            point_time = _point_time(point)
+            if cutoff_time is not None and point_time is not None and point_time > cutoff_time:
+                continue
             history[model].append(point)
 
-    # batch_id may be date-only or timestamp-style; monitored_at is ISO.
     for model in TRACKED_MODELS:
-        history[model].sort(key=lambda point: point.get("monitored_at") or point.get("batch_id") or "")
+        history[model].sort(key=lambda point: _point_time(point) or datetime.max)
         logger.info("Loaded %d prior %s point(s) from %s", len(history[model]), model, monitoring_base)
 
     return history
 
 
-def load_csi_feature_history(spark, paths: dict, model: str = "production") -> dict[str, list[dict]]:
+def load_csi_feature_history(spark, paths: dict, model: str = "production", cutoff_time: datetime | None = None) -> dict[str, list[dict]]:
     """
     Read back the PER-FEATURE CSI over time from monitoring/{batch_id}/metrics.json
     (block[model]["csi_per_feature"]), so each of the top-50 features can be plotted
@@ -759,19 +793,24 @@ def load_csi_feature_history(spark, paths: dict, model: str = "production") -> d
         if not block:
             continue
         run_id = block.get("run_id")
+        batch_dir_name = Path(batch_dir.rstrip("/")).name
         for lemma, detail in (block.get("csi_per_feature") or {}).items():
             if detail.get("csi") is None:
                 continue
-            history.setdefault(lemma, []).append({
+            point = {
                 "monitored_at": report.get("monitored_at"),
-                "batch_id": report.get("batch_id"),
+                "batch_id": report.get("batch_id") or batch_dir_name,
                 "run_id": run_id,
                 "csi": detail["csi"],
                 "gyr": detail.get("gyr"),
-            })
+            }
+            point_time = _point_time(point)
+            if cutoff_time is not None and point_time is not None and point_time > cutoff_time:
+                continue
+            history.setdefault(lemma, []).append(point)
 
     for lemma in history:
-        history[lemma].sort(key=lambda point: point.get("monitored_at") or point.get("batch_id") or "")
+        history[lemma].sort(key=lambda point: _point_time(point) or datetime.max)
     logger.info("Loaded per-feature CSI history for %d features", len(history))
     return history
 
@@ -828,7 +867,13 @@ MODEL_STYLES = {
 
 
 def _point_time(point: dict) -> datetime | None:
-    """Parse a history point's timestamp for the x-axis (ISO, else batch_id)."""
+    """Parse a history point's batch date for the x-axis, falling back to monitored_at."""
+    batch_id = point.get("batch_id") or ""
+    for fmt in ("%Y%m%d", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(batch_id, fmt)
+        except ValueError:
+            pass
     iso = point.get("monitored_at")
     if iso:
         try:
@@ -836,13 +881,21 @@ def _point_time(point: dict) -> datetime | None:
             return datetime.fromisoformat(iso.replace("Z", "+00:00")).replace(tzinfo=None)
         except ValueError:
             pass
-    batch_id = point.get("batch_id") or ""
-    for fmt in ("%Y%m%d", "%Y%m%dT%H%M%S"):
-        try:
-            return datetime.strptime(batch_id, fmt)
-        except ValueError:
-            pass
     return None
+
+
+def _timed_xy(points: list[dict], key: str) -> tuple[list[datetime], list[float]]:
+    xs: list[datetime] = []
+    ys: list[float] = []
+    for point in points:
+        x = _point_time(point)
+        y = point.get(key)
+        if x is None or y is None:
+            logger.warning("Skipping monitoring point with unparseable x-axis time: %s", point)
+            continue
+        xs.append(x)
+        ys.append(y)
+    return xs, ys
 
 
 def _segments_by_run_id(series: list[dict]) -> list[list[dict]]:
@@ -913,6 +966,10 @@ def build_performance_plot(
         f"Performance Monitoring — batch {batch_id}  ({generated_at[:19]} UTC)",
         fontsize=12, fontweight="bold",
     )
+    plotted_xs: list[datetime] = []
+    current_batch_time = _point_time({"batch_id": batch_id})
+    if current_batch_time is not None:
+        plotted_xs.append(current_batch_time)
 
     for ax, (key, title, bands, ylim) in zip(axes, PERF_METRICS):
         # GYR zones
@@ -926,12 +983,20 @@ def build_performance_plot(
             style = MODEL_STYLES[model]
             # Drop days missing this metric (e.g. no ground truth -> no macro_f1).
             series = [point for point in raw_series if point.get(key) is not None]
-            for seg in _segments_by_run_id(series):
+            segments = _segments_by_run_id(series)
+            if not segments and model == "production":
+                baseline = baselines.get(T0_EXP_ID)
+                if baseline and baseline.get(key) is not None:
+                    segments = [[{"run_id": T0_EXP_ID}]]
+
+            for seg in segments:
                 run_id = seg[0].get("run_id")
                 seg_with_t0, t0_time = _prepend_t0(seg, baselines.get(run_id), key)
 
-                xs = [_point_time(p) for p in seg_with_t0]
-                ys = [p.get(key) for p in seg_with_t0]
+                xs, ys = _timed_xy(seg_with_t0, key)
+                if not xs:
+                    continue
+                plotted_xs.extend(xs)
                 ax.plot(
                     xs, ys,
                     color=style["color"], marker=style["marker"],
@@ -956,6 +1021,13 @@ def build_performance_plot(
         unique = dict(zip(labels, handles))
         if unique:
             ax.legend(unique.values(), unique.keys(), fontsize=7.5, loc="best")
+
+    if plotted_xs:
+        start = min(plotted_xs) - timedelta(days=1)
+        end = max(plotted_xs) + timedelta(days=1)
+        if start == end:
+            end = start + timedelta(days=2)
+        axes[-1].set_xlim(start, end)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate(rotation=30)
@@ -1015,8 +1087,9 @@ def build_stability_plot(
             style = MODEL_STYLES[model]
             series = [point for point in raw_series if point.get(key) is not None]
             for seg in _segments_by_run_id(series):
-                xs = [_point_time(p) for p in seg]
-                ys = [p[key] for p in seg]
+                xs, ys = _timed_xy(seg, key)
+                if not xs:
+                    continue
                 if ys:
                     y_max = max(y_max, max(ys))
                 ax.plot(
@@ -1235,8 +1308,9 @@ def build_csi_feature_grid_plot(
         series = feature_history.get(feature["lemma"], [])
         y_max = PSI_YELLOW * 1.2
         for seg in _segments_by_run_id(series):
-            xs = [_point_time(p) for p in seg]
-            ys = [p["csi"] for p in seg]
+            xs, ys = _timed_xy(seg, "csi")
+            if not xs:
+                continue
             if ys:
                 y_max = max(y_max, max(ys))
             ax.plot(xs, ys, color=color, marker="o", markersize=2.5, linewidth=1.0, zorder=3)
@@ -1293,8 +1367,9 @@ def build_csi_top_features_plot(
         series = feature_history.get(feature["lemma"], [])
         labelled = False
         for seg in _segments_by_run_id(series):
-            xs = [_point_time(p) for p in seg]
-            ys = [p["csi"] for p in seg]
+            xs, ys = _timed_xy(seg, "csi")
+            if not xs:
+                continue
             if ys:
                 y_max = max(y_max, max(ys))
             ax.plot(
@@ -1469,7 +1544,8 @@ def run_monitoring(
     write_json(spark, f"{base_dir}/metrics.json", report, overwrite=True)
 
     # Trend plots: production champion (+ shadow line if configured) over time.
-    history = load_metric_history(spark, paths)
+    current_point_time = _point_time({"batch_id": batch_id, "monitored_at": monitored_at})
+    history = load_metric_history(spark, paths, cutoff_time=current_point_time)
     # T=0 baselines keyed by run_id (each model version anchors its own segment).
     # NOTE: only the current production model's baseline is loaded here; historical
     # promoted segments won't get a T=0 star until per-run_id baseline loading is added.
@@ -1494,7 +1570,7 @@ def run_monitoring(
 
         # Per-feature CSI trends over time (this batch's per-feature CSI is now in
         # history): one panel per feature, plus the top-3 overlaid for comparison.
-        feature_history = load_csi_feature_history(spark, paths)
+        feature_history = load_csi_feature_history(spark, paths, cutoff_time=current_point_time)
         if feature_history:
             features = csi_values["features"]
             _safe_plot(spark, f"{base_dir}/csi_feature_trends.png",

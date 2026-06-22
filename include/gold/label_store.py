@@ -21,7 +21,8 @@ LABEL_STORE_TABLE = "label_store"
 ID_COLUMN = "CELEX"
 LABEL_COLUMN = "labels"
 SPLIT_COLUMN = "category"
-INFERENCE_CATEGORY = "inference"
+PRODUCTION_UNLABELLED_CATEGORY = "production_unlabelled"
+PRODUCTION_LABELLED_CATEGORY = "production_labelled"
 DEFAULT_OOT_START_YEAR = 2004
 HOLDOUT_FRACTION_OF_PRE_OOT = 3 / 10
 TEST_FRACTION_OF_HOLDOUT = 1 / 3
@@ -118,19 +119,20 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
 
     has_labels = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
     labelled = label_store.filter(has_labels)
-    inference = label_store.filter(~has_labels).withColumn(SPLIT_COLUMN, F.lit(INFERENCE_CATEGORY))
+    production_unlabelled = label_store.filter(~has_labels).withColumn(SPLIT_COLUMN, F.lit(PRODUCTION_UNLABELLED_CATEGORY))
 
     if labelled.limit(1).count() == 0:
-        logger.info("No labelled documents found; assigning all rows to category=%s", INFERENCE_CATEGORY)
-        return inference
+        logger.info("No labelled documents found; assigning all rows to category=%s", PRODUCTION_UNLABELLED_CATEGORY)
+        return production_unlabelled
 
     pre_oot = labelled.filter(snapshot_year < oot_start_year)
-    oot = labelled.filter(snapshot_year >= oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
+    oot = labelled.filter(snapshot_year == oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
+    production_labelled = labelled.filter(snapshot_year > oot_start_year).withColumn(SPLIT_COLUMN, F.lit(PRODUCTION_LABELLED_CATEGORY))
 
     pre_oot_rows = pre_oot.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
     if not pre_oot_rows:
-        logger.info("No pre-OOT documents available; returning OOT/inference-only split assignment")
-        return oot.unionByName(inference)
+        logger.info("No pre-OOT documents available; returning OOT/production-labelled/production-unlabelled split assignment")
+        return oot.unionByName(production_labelled).unionByName(production_unlabelled)
 
     assignments, stratified_label_count = split_pre_oot_documents(pre_oot_rows, random_seed=random_seed)
     assignment_schema = T.StructType(
@@ -147,7 +149,7 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
         f"{stratified_label_count:,}",
         f"{len(pre_oot_rows):,}",
     )
-    return train_validation_test.unionByName(oot).unionByName(inference)
+    return train_validation_test.unionByName(oot).unionByName(production_labelled).unionByName(production_unlabelled)
 
 
 def main() -> None:

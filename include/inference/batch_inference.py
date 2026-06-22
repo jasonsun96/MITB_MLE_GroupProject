@@ -3,19 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+GOLD_DIR = PROJECT_ROOT / "include" / "gold"
+for _path in (PROJECT_ROOT, GOLD_DIR):
+    _entry = str(_path)
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
 from include.inference.model_registry import (hadoop_path_exists, read_json,
                                               write_json)
 from include.model_pipeline.multilabel_core import (load_trained_models,
                                                     load_training_manifest)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from run_paths import model_bank_per_label_models_dir
 
 logger = logging.getLogger(__name__)
 DEFAULT_FEATURE_CONFIG_PATH = PROJECT_ROOT / "config" / "batch_inference.yaml"
@@ -187,7 +192,22 @@ def load_or_create_manifest(
     manifest_path = f"{paths['output']}/{batch_id}/manifest.json"
     if hadoop_path_exists(spark, manifest_path):
         logger.info("Reusing manifest at %s", manifest_path)
-        return read_json(spark, manifest_path)
+        manifest = read_json(spark, manifest_path)
+        feature_input_paths = manifest.get("feature_input_paths") or {"production": manifest["input_path"]}
+        current_versions = {
+            group: get_delta_version(spark, path)
+            for group, path in feature_input_paths.items()
+        }
+        if current_versions != (manifest.get("input_versions") or {}):
+            logger.info(
+                "Feature input versions changed for batch %s; refreshing manifest input_versions",
+                batch_id,
+            )
+            manifest["input_versions"] = current_versions
+            manifest["input_version"] = current_versions.get("production")
+            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json(spark, manifest_path, manifest, overwrite=True)
+        return manifest
 
     production, shadow = load_deployment_aliases(feature_config_path)
     shadow_run_id = shadow["run_id"] if shadow else None
@@ -279,6 +299,58 @@ def validate_feature_run(source, contract: dict, group: str) -> None:
             )
 
 
+def _safe_label_name(label: str) -> str:
+    return re.sub(r"[^\w.-]", "_", label)[:128]
+
+
+def _model_metadata_path(model_path: str) -> str:
+    return f"{model_path.rstrip('/')}/metadata"
+
+
+def _current_per_label_model_path(exp_id: str, label: str, original_path: str) -> str:
+    current_base = model_bank_per_label_models_dir(exp_id).rstrip("/")
+    original_leaf = original_path.rstrip("/").rsplit("/", 1)[-1]
+    safe_leaf = _safe_label_name(label)
+    return f"{current_base}/{original_leaf or safe_leaf}"
+
+
+def _resolve_per_label_model_paths(spark, exp_id: str, manifest_path: str, per_label_paths: dict[str, str]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    missing: list[tuple[str, str]] = []
+
+    for label, path in per_label_paths.items():
+        metadata_path = _model_metadata_path(path)
+        if hadoop_path_exists(spark, metadata_path):
+            resolved[label] = path
+            continue
+
+        current_path = _current_per_label_model_path(exp_id, label, path)
+        current_metadata_path = _model_metadata_path(current_path)
+        if current_path != path and hadoop_path_exists(spark, current_metadata_path):
+            logger.warning(
+                "Model manifest at %s points label=%r to missing legacy path %s; using %s",
+                manifest_path,
+                label,
+                path,
+                current_path,
+            )
+            resolved[label] = current_path
+            continue
+
+        missing.append((label, metadata_path))
+
+    if missing:
+        preview = "\n".join(f"- {label}: {path}" for label, path in missing[:10])
+        suffix = "" if len(missing) <= 10 else f"\n... and {len(missing) - 10} more"
+        raise FileNotFoundError(
+            f"Model manifest at {manifest_path} references missing Spark model metadata paths:\n"
+            f"{preview}{suffix}\n"
+            "Retrain the experiment or update the manifest to point at existing per-label models."
+        )
+
+    return resolved
+
+
 def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
     exp_id = _clean_optional(model_config.get("exp_id"))
     model_type = _clean_optional(model_config.get("model_type"))
@@ -305,6 +377,7 @@ def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
         raise ValueError(f"Model manifest at {manifest_path} has invalid multilabel_threshold")
 
     labels = list(per_label_paths.keys())
+    per_label_paths = _resolve_per_label_model_paths(spark, exp_id, manifest_path, per_label_paths)
     models = load_trained_models(per_label_paths, model_type)
     return {
         "run_id": run_id,
@@ -356,12 +429,13 @@ def score_cohort(df, contract: dict):
         values = probability.toArray()
         return float(values[1]) if len(values) > 1 else float(values[0])
 
-    scored = df
+    features = df.select("document_id", "features")
+    scored = df.select("document_id", "deployment_group")
     probability_columns = []
     for index, label in enumerate(contract["labels"]):
         column = f"_probability_{index}"
         model = contract["models"][label]
-        probabilities = model.transform(scored).select(
+        probabilities = model.transform(features).select(
             "document_id",
             positive_probability("probability").alias(column),
         )
@@ -552,6 +626,9 @@ def run_batch(
     for output in outputs[1:]:
         predictions = predictions.unionByName(output)
 
+    predictions.write.format("delta").mode("overwrite").save(manifest["predictions_path"])
+    predictions = spark.read.format("delta").load(manifest["predictions_path"])
+
     validation = validate_predictions(
         sources["production"],
         predictions,
@@ -559,7 +636,6 @@ def run_batch(
         input_count,
         allowed_labels,
     )
-    predictions.write.format("delta").mode("overwrite").save(manifest["predictions_path"])
     published_path = manifest.get(
         "published_predictions_path",
         load_paths(feature_config_path)["published_predictions"],
