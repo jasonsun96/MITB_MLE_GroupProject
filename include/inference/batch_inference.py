@@ -93,6 +93,15 @@ def _clean_optional(value) -> str | None:
     return text or None
 
 
+def _parse_prediction_threshold(value, field_name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    threshold = float(value)
+    if not 0 <= threshold <= 1:
+        raise ValueError(f"Feature config {field_name} must be between 0 and 1")
+    return threshold
+
+
 def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
     deployment = config.get("deployment") or {}
     if not isinstance(deployment, dict):
@@ -125,6 +134,10 @@ def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
         "exp_id": exp_id,
         "model_type": model_type,
         "model_date": _clean_optional(entry.get("model_date")),
+        "prediction_threshold": _parse_prediction_threshold(
+            entry.get("prediction_threshold"),
+            f"deployment.{name}.prediction_threshold",
+        ),
         "source": "github_config",
     }
 
@@ -193,6 +206,18 @@ def load_or_create_manifest(
     if hadoop_path_exists(spark, manifest_path):
         logger.info("Reusing manifest at %s", manifest_path)
         manifest = read_json(spark, manifest_path)
+        production, shadow = load_deployment_aliases(feature_config_path)
+        if (
+            manifest.get("production_model_config", {}).get("prediction_threshold")
+            != production.get("prediction_threshold")
+            or (manifest.get("shadow_model_config") or {}).get("prediction_threshold")
+            != ((shadow or {}).get("prediction_threshold"))
+        ):
+            manifest["production_model_config"] = production
+            if manifest.get("shadow_run_id"):
+                manifest["shadow_model_config"] = shadow
+            manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+            write_json(spark, manifest_path, manifest, overwrite=True)
         feature_input_paths = manifest.get("feature_input_paths") or {"production": manifest["input_path"]}
         current_versions = {
             group: get_delta_version(spark, path)
@@ -372,9 +397,10 @@ def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
     if not manifest.get("feature_set"):
         raise ValueError(f"Model manifest at {manifest_path} missing feature_set")
 
-    threshold = float(manifest.get("multilabel_threshold", 0.5))
+    threshold = model_config.get("prediction_threshold")
+    threshold = float(threshold if threshold is not None else manifest.get("multilabel_threshold", 0.5))
     if not 0 <= threshold <= 1:
-        raise ValueError(f"Model manifest at {manifest_path} has invalid multilabel_threshold")
+        raise ValueError(f"Model config for run {run_id} has invalid prediction_threshold")
 
     labels = list(per_label_paths.keys())
     per_label_paths = _resolve_per_label_model_paths(spark, exp_id, manifest_path, per_label_paths)
@@ -538,6 +564,7 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
         "prediction_count": prediction_count,
         "production_count": counts["production"],
         "shadow_count": counts["shadow"],
+        "prediction_thresholds": manifest.get("prediction_thresholds", {}),
         "validated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -577,6 +604,10 @@ def run_batch(
 
     manifest = load_or_create_manifest(spark, batch_id, input_path, feature_config_path)
     contracts = validate_model_contracts(spark, manifest)
+    manifest["prediction_thresholds"] = {
+        group: contract["threshold"]
+        for group, contract in contracts.items()
+    }
 
     if "feature_input_paths" not in manifest and "input_version" not in manifest:
         logger.warning(

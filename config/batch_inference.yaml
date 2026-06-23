@@ -4,6 +4,7 @@ deployment:
     exp_id: exp004_LR_tfidf_dcw_gs
     model_type: logistic_regression
     model_date: "20260615"
+    prediction_threshold: 0.45
 
   shadow:
     enabled: false
@@ -11,6 +12,7 @@ deployment:
     exp_id:
     model_type:
     model_date:
+    prediction_threshold:
 
 features:
   gold_run_id: run004
