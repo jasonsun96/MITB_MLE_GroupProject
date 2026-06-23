@@ -25,7 +25,7 @@ COMMON = dict(
 with DAG(
     dag_id="batch_inference_pipeline",
     start_date=datetime.datetime(2027, 1, 1),
-    schedule="@daily",
+    schedule="@monthly",
     catchup=False,
     max_active_runs=1,
     params={

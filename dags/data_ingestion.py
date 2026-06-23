@@ -39,7 +39,7 @@ def should_run_wiki_branch(**context) -> bool:
 with DAG(
     dag_id="medallion_pipeline",
     start_date=datetime.datetime(2027, 1, 1),
-    schedule="@daily",
+    schedule="@monthly",
     max_active_runs=1,
     catchup=False,
     default_args=DEFAULT_ARGS,
