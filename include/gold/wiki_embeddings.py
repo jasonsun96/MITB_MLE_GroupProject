@@ -1,20 +1,3 @@
-"""
-gold Legal-BERT embeddings for the wiki (non-law baseline) corpus.
-
-mirror of legal_embeddings.py but reads from wiki bronze. wiki has a different
-schema:
-  - id column is `id` (legal uses CELEX)
-  - text column is `text` (legal uses act_raw_text)
-  - no labels column yet (Cheewei is adding them, null until then)
-  - no snapshot_date (no partitionBy on write)
-
-same model and chunk-and-pool strategy as legal so the two gold tables stay
-comparable downstream.
-
-wiki docs are short (median ~100 words), so most will produce just one chunk
-and run much faster than legal.
-"""
-
 import argparse
 import logging
 from pathlib import Path
@@ -23,6 +6,7 @@ import pyspark.sql.functions as F
 import yaml
 from pyspark.sql.types import (ArrayType, FloatType, IntegerType, StringType,
                                StructField, StructType)
+
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: Legal-BERT embeddings (wiki)")

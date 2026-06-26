@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import logging
 from datetime import datetime
@@ -196,6 +194,7 @@ def main() -> None:
         default=None,
         help="Operational batch id to stamp on ingested legal documents.",
     )
+    parser.add_argument("--skip-wiki", action="store_true", help="Skip wiki_docs ingestion.")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -216,7 +215,8 @@ def main() -> None:
 
     spark = create_spark_session("ingest-bronze")
     ingest_legal_docs(spark, landing, bronze, start_date, end_date, args.batch_id)
-    ingest_wiki_docs(spark, landing, bronze)
+    if not args.skip_wiki:
+        ingest_wiki_docs(spark, landing, bronze)
 
     logger.info("Bronze ingest complete")
 

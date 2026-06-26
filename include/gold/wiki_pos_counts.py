@@ -1,13 +1,3 @@
-"""
-gold POS counts for the wiki (non-law baseline) corpus.
-
-same idea as pos_counts.py but reading from wiki silver instead. wiki has
-a different schema so a few column tweaks:
-  - id column is `id` (legal uses CELEX)
-  - text column is `text` (legal uses act_raw_text)
-  - no labels column, no snapshot_date, no partitionBy on write
-"""
-
 import argparse
 import logging
 from pathlib import Path
@@ -16,6 +6,7 @@ import pyspark.sql.functions as F
 import yaml
 from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
                                StructType)
+
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts (wiki)")

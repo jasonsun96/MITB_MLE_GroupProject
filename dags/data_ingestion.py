@@ -110,14 +110,7 @@ with DAG(
         **COMMON,
     )
 
-    # ---- dependencies ----
-    # gold jobs read SILVER tables, so they must run after their silver task
     bronze_ingest >> [silver_legal, run_wiki_branch]
     run_wiki_branch >> silver_wiki
     silver_legal >> [build_label_store, gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
     silver_wiki >> [gold_pos_counts_wiki, gold_wiki_embeddings]
-
-    # ---- not yet wired (pending label_store/labels table + column alignment) ----
-    # tfidf_processing.py        << [gold_ngram_counts, build_label_store]
-    # domain_concept_weight.py   << [gold_pos_counts, gold_pos_counts_wiki, build_label_store]
-    # model_training.py          << [tfidf, dcw, gold_legal_embeddings, build_label_store]

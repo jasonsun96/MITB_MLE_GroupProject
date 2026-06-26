@@ -1,6 +1,3 @@
-"""Shared multi-label Spark ML primitives: features, scoring, metrics, I/O."""
-from __future__ import annotations
-
 import argparse
 import itertools
 import logging
@@ -1005,31 +1002,6 @@ def _global_top_score(feature_importance: dict[str, Any]) -> tuple[str, float]:
         if key in row:
             return row["feature"], float(row[key])
     raise ValueError("global_top row missing mean_abs_coefficient or mean_importance")
-
-
-def _iter_param_combos(
-    keys: list[str],
-    param_grid: dict[str, list[Any]],
-    defaults: dict[str, Any],
-) -> list[dict[str, Any]]:
-    value_lists = [param_grid.get(key, defaults[key]) for key in keys]
-    return [dict(zip(keys, combo, strict=True)) for combo in itertools.product(*value_lists)]
-
-
-def _default_param_grid(model_type: str) -> dict[str, list[Any]]:
-    if model_type == "logistic_regression":
-        return DEFAULT_LR_PARAM_GRID
-    if model_type == "random_forest":
-        return DEFAULT_RF_PARAM_GRID
-    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
-
-
-def _default_model_params(model_type: str) -> dict[str, Any]:
-    if model_type == "logistic_regression":
-        return dict(LR_PARAMS)
-    if model_type == "random_forest":
-        return dict(RF_PARAMS)
-    raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
 
 
 def _iter_param_combos(

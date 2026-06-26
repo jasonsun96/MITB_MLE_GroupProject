@@ -1,89 +1,3 @@
-'''
-Batch-inference monitoring for the Legal Topic Tagger.
-
-================================================================================
-ASSUMPTIONS & THINGS THAT PROBABLY NEED CHANGING
-================================================================================
-UPSTREAM DATA CONTRACTS
-
-• inference_features (gold) must contain:
-- document_id
-- dcw_features as MAP<STRING, DOUBLE>
-where keys are DCW lemmas. Used by CSI production monitoring. → load_csi_production_values()
-
-• published_predictions (gold) must contain:
-- batch_id
-- document_id
-- predicted_labels ARRAY
-Used by performance, PSI, and CSI monitoring. → load_batch_predictions()
-
-• Reviewed production labels must be appended to label_store with:
-category = 'production'
-Used for Macro F1 and Hamming Loss calculation. → REVIEWED_CATEGORY, load_ground_truth()
-
-MODEL RESOLUTION
-• T0_EXP_ID is currently hardcoded as the production model.
-
-• SHADOW_MODEL_PATH is optional and disabled by default.
-Set it to a predictions table to enable shadow-model comparison.→ SHADOW_MODEL_PATH
-
-MONITORING STORAGE
-• Historical trends are rebuilt by scanning: monitoring/*/metrics.json
-
-PATHS / SCHEMA (schema.yaml):
-  • Paths not in schema are hardcoded here (GOLD_RUNS_DIR, GOLD_MODEL_PREDICTIONS_DIR). 
-
-================================================================================
- WHAT THIS CODE DOES
-================================================================================
-
-Runs once per batch (typically immediately after batch inference) and writes
-monitoring artifacts under:
-
-    monitoring/{batch_id}/
-
-Artifacts produced:
-
-  metrics.json
-      Monitoring metrics for the current batch.
-
-  performance.png
-      Time-series plot of Macro F1 and Hamming Loss using reviewed
-      production documents only.
-
-  stability.png
-      Time-series plot of PSI (prediction drift, worst label vs
-      train) and CSI (feature drift, worst of top-50 features).
-
-  psi_distribution.png
-      Per-label expected-vs-actual predicted prevalence comparison
-      for the current batch; labels with 0 positives in the small
-      reviewed-GT sample get a low-confidence "⚠ 0/N reviewed" hint.
-
-  psi_label_trends.png
-      Historical PSI trend for every label, overlaid on one chart.
-
-  psi_label_trends_separate.png
-      The same per-label PSI trends, but one panel per label
-      (small-multiples grid).
-
-  csi_distribution.png
-      Baseline-vs-production feature distribution comparison
-      for all monitored CSI features.
-
-  csi_distribution_top3.png
-      Same as above but limited to the top 3 globally-important
-      monitored features.
-
-  csi_feature_trends.png
-      Historical CSI trend for every monitored feature.
-
-  csi_feature_trends_top3.png
-      Historical CSI trend for the top 3 globally-important
-      monitored features.
-'''
-from __future__ import annotations
-
 import argparse
 import io
 import json
@@ -144,25 +58,8 @@ def _join_storage_path(base: str, path: str) -> str:
     return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
-def load_feature_config(config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml") -> dict:
-    if not config_path:
-        return {}
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    if not path.exists():
-        logger.info("Feature config not found at %s; using schema defaults", path)
-        return {}
-    with path.open() as config_file:
-        config = yaml.safe_load(config_file) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"Feature config must be a YAML mapping: {path}")
-    return config
-
-
 def load_paths(
     schema: dict,
-    feature_config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml",
     input_path: str | None = None,
     batch_id: str | None = None,
 ) -> dict:
@@ -171,13 +68,8 @@ def load_paths(
     tables = gold.get("tables") or {}
     corpus = gold.get("corpus") or {}
     runs = gold.get("runs") or {}
-    feature_config = load_feature_config(feature_config_path)
-    configured_features = feature_config.get("features") or {}
-    if not isinstance(configured_features, dict):
-        raise ValueError("Feature config field 'features' must be a mapping")
     gold_run_id = str(
-        configured_features.get("gold_run_id")
-        or runs.get("default_gold_run_id")
+        runs.get("default_gold_run_id")
         or runs.get("default_run_id")
         or ""
     ).strip()
@@ -192,13 +84,8 @@ def load_paths(
     )
     published_predictions_path = tables.get("published_predictions", {}).get("path") or "published_predictions"
     batch_inference_path = tables.get("batch_inference", {}).get("path") or "batch_inference"
-    configured_input_paths = configured_features.get("input_paths") or {}
-    if configured_input_paths and not isinstance(configured_input_paths, dict):
-        raise ValueError("Feature config field 'features.input_paths' must be a mapping")
     inference_features_path = (
         input_path
-        or configured_features.get("input_path")
-        or configured_input_paths.get("production")
         or tables.get("inference_features", {}).get("path")
         or (f"{batch_inference_path}/{batch_id}/features/production" if batch_id else None)
         or f"{runs.get('base', 'runs')}/{gold_run_id}/{runs.get('X_unlabelled', 'X_unlabelled')}"
@@ -1715,7 +1602,6 @@ def _monitor_production(spark, paths: dict, batch_id: str, t0: dict) -> tuple[di
 def run_monitoring(
     spark,
     batch_id: str,
-    feature_config_path: str | Path | None = PROJECT_ROOT / "config" / "batch_inference.yaml",
     input_path: str | None = None,
 ) -> dict:
     """
@@ -1729,7 +1615,7 @@ def run_monitoring(
     production is tracked.
     """
     schema = load_schema()
-    paths = load_paths(schema, feature_config_path, input_path, batch_id)
+    paths = load_paths(schema, input_path, batch_id)
     monitored_at = datetime.now(timezone.utc).isoformat()
     base_dir = f"{paths['monitoring_base']}/{batch_id}"
     logger.info("Monitoring batch %s -> %s", batch_id, base_dir)
@@ -1811,7 +1697,6 @@ def run_monitoring(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch inference monitoring")
     parser.add_argument("--batch-id", required=True)
-    parser.add_argument("--feature-config", default=str(PROJECT_ROOT / "config" / "batch_inference.yaml"))
     parser.add_argument("--input-path")
     parser.add_argument(
         "--log-level",
@@ -1831,7 +1716,7 @@ def main() -> None:
     spark = create_spark_session("batch-inference-monitoring")
     try:
         print(json.dumps(
-            run_monitoring(spark, args.batch_id, args.feature_config, args.input_path),
+            run_monitoring(spark, args.batch_id, args.input_path),
             indent=2,
             sort_keys=True,
         ))

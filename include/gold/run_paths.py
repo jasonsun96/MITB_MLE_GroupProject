@@ -1,11 +1,8 @@
-"""Central path helpers for gold runs, model_bank features, and experiments."""
-
 import re
 from datetime import datetime, timezone
 from typing import Any
 
 import yaml
-
 from gold_io import PROJECT_ROOT
 
 _SCHEMA: dict[str, Any] | None = None

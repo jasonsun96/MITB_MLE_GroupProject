@@ -12,6 +12,8 @@ R2_ENV = {
     "R2_ACCESS_KEY_ID": os.environ.get("R2_ACCESS_KEY_ID", ""),
     "R2_SECRET_ACCESS_KEY": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
     "PYTHONPATH": "/app:/app/include:/app/include/gold",
+    "SPARK_MASTER": "local[2]",
+    "SPARK_DRIVER_MEMORY": "8g",
 }
 
 COMMON = dict(
@@ -29,7 +31,6 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     params={
-        "feature_config": "config/batch_inference.yaml",
         "input_path": "",
     },
 ):
@@ -40,8 +41,7 @@ with DAG(
             "python -c \"print('Skipping assemble_inference_features: input_path provided')\""
             "{% else %}"
             "python include/model_pipeline/assemble_inference_features.py "
-            f"--batch-id {BATCH_ID_TEMPLATE} "
-            "--config {{ params.feature_config }}"
+            f"--batch-id {BATCH_ID_TEMPLATE}"
             "{% endif %}"
         ),
         execution_timeout=datetime.timedelta(hours=4),
@@ -50,31 +50,14 @@ with DAG(
 
     run_batch_inference = DockerOperator(
         task_id="run_batch_inference",
-        command=(
-            "python include/inference/batch_inference.py "
-            f"--batch-id {BATCH_ID_TEMPLATE} "
-            "--feature-config {{ params.feature_config }} "
-            "{% if params.input_path %}"
-            "--input-path '{{ params.input_path }}'"
-            "{% endif %}"
-        ),
+        command=("python include/inference/batch_inference.py " f"--batch-id {BATCH_ID_TEMPLATE} " "{% if params.input_path %}" "--input-path '{{ params.input_path }}'" "{% endif %}"),
         execution_timeout=datetime.timedelta(hours=4),
         **COMMON,
     )
 
-    # Monitoring runs on the same batch once production predictions are published.
-    # If shadow predictions were staged, monitoring adds shadow performance to the
-    # dashboard without publishing shadow outputs.
     run_monitoring = DockerOperator(
         task_id="run_monitoring",
-        command=(
-            "python include/monitoring/monitoring.py "
-            f"--batch-id {BATCH_ID_TEMPLATE} "
-            "--feature-config {{ params.feature_config }} "
-            "{% if params.input_path %}"
-            "--input-path '{{ params.input_path }}'"
-            "{% endif %}"
-        ),
+        command=("python include/monitoring/monitoring.py " f"--batch-id {BATCH_ID_TEMPLATE} " "{% if params.input_path %}" "--input-path '{{ params.input_path }}'" "{% endif %}"),
         execution_timeout=datetime.timedelta(hours=1),
         **COMMON,
     )

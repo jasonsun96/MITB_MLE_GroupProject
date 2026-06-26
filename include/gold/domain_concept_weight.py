@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pyspark.sql.functions as F
+from gold_io import load_pickle, save_pickle, write_delta
 from pyspark.sql.types import (ArrayType, DoubleType, IntegerType, LongType,
                                MapType, StringType, StructField, StructType)
-from utils.spark_session import create_spark_session
-
-from gold_io import load_pickle, save_pickle, write_delta
 from run_paths import (corpus_table_path, default_feature_run_id,
                        resolve_feature_run_paths)
+
+from utils.spark_session import create_spark_session
 
 _GOLD_DIR = Path(__file__).resolve().parent
 for _entry in (str(_GOLD_DIR.parents[1]), str(_GOLD_DIR)):
@@ -367,4 +367,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import json
 import logging
@@ -16,14 +14,14 @@ for _path in (PROJECT_ROOT, GOLD_DIR):
     if _entry not in sys.path:
         sys.path.insert(0, _entry)
 
-from include.inference.model_registry import (hadoop_path_exists, read_json,
+from include.inference.model_registry import (_clean_optional, get_alias, hadoop_path_exists,
+                                              load_registry_paths, read_json,
                                               write_json)
 from include.model_pipeline.multilabel_core import (load_trained_models,
                                                     load_training_manifest)
 from run_paths import model_bank_per_label_models_dir
 
 logger = logging.getLogger(__name__)
-DEFAULT_FEATURE_CONFIG_PATH = PROJECT_ROOT / "config" / "batch_inference.yaml"
 
 
 def _join_storage_path(base: str, path: str) -> str:
@@ -32,24 +30,7 @@ def _join_storage_path(base: str, path: str) -> str:
     return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
-def load_feature_config(config_path: str | Path | None) -> dict:
-    import yaml
-
-    if not config_path:
-        return {}
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    if not path.exists():
-        raise FileNotFoundError(f"Feature config not found: {path}")
-    with path.open() as config_file:
-        config = yaml.safe_load(config_file) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"Feature config must be a YAML mapping: {path}")
-    return config
-
-
-def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH) -> dict[str, Any]:
+def load_paths() -> dict[str, Any]:
     import yaml
 
     with (PROJECT_ROOT / "schema.yaml").open() as schema_file:
@@ -58,39 +39,12 @@ def load_paths(feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_P
     gold = schema["gold"]
     base = gold["path"].rstrip("/")
     tables = gold.get("tables") or {}
-    feature_config = load_feature_config(feature_config_path)
-    feature_paths = feature_config.get("features") or {}
-    if not isinstance(feature_paths, dict):
-        raise ValueError("Feature config field 'features' must be a mapping")
-
-    configured_input = feature_paths.get("input_path")
-    configured_inputs = feature_paths.get("input_paths") or {}
-    if configured_inputs and not isinstance(configured_inputs, dict):
-        raise ValueError("Feature config field 'features.input_paths' must be a mapping")
-    configured_gold_run_id = feature_paths.get("gold_run_id")
-    default_gold_run_id = gold["runs"].get("default_gold_run_id", gold["runs"]["default_run_id"])
-    gold_run_id = str(configured_gold_run_id or default_gold_run_id).strip()
-    inference_features = configured_input or tables.get("inference_features", {}).get("path") or f"{gold['runs']['base']}/{gold_run_id}/{gold['runs']['X_unlabelled']}"
     batch_inference = tables.get("batch_inference", {}).get("path") or "batch_inference"
     published_predictions = tables.get("published_predictions", {}).get("path") or "published_predictions"
     return {
-        "input": _join_storage_path(base, str(inference_features)),
-        "input_configured": bool(configured_input or tables.get("inference_features", {}).get("path")),
-        "feature_input_paths": {
-            key: _join_storage_path(base, str(value))
-            for key, value in configured_inputs.items()
-            if value
-        },
         "output": _join_storage_path(base, str(batch_inference)),
         "published_predictions": _join_storage_path(base, str(published_predictions)),
     }
-
-
-def _clean_optional(value) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
 
 
 def _parse_prediction_threshold(value, field_name: str) -> float | None:
@@ -98,59 +52,42 @@ def _parse_prediction_threshold(value, field_name: str) -> float | None:
         return None
     threshold = float(value)
     if not 0 <= threshold <= 1:
-        raise ValueError(f"Feature config {field_name} must be between 0 and 1")
+        raise ValueError(f"{field_name} must be between 0 and 1")
     return threshold
 
 
-def _deployment_alias_from_config(config: dict, name: str) -> dict | None:
-    deployment = config.get("deployment") or {}
-    if not isinstance(deployment, dict):
-        raise ValueError("Feature config field 'deployment' must be a mapping")
-
-    entry = deployment.get(name)
-    if entry is None:
-        return None
-    if not isinstance(entry, dict):
-        raise ValueError(f"Feature config field 'deployment.{name}' must be a mapping")
-
-    if name == "shadow" and entry.get("enabled") is False:
+def _deployment_alias_from_registry(spark, name: str) -> dict | None:
+    registry_alias = get_alias(spark, load_registry_paths(), name)
+    if registry_alias is None:
         return None
 
-    run_id = _clean_optional(entry.get("run_id")) or _clean_optional(entry.get("exp_id"))
-    if not run_id:
-        if name == "production" or entry.get("enabled") is True:
-            raise ValueError(f"Feature config deployment.{name} must define run_id")
-        return None
-    exp_id = _clean_optional(entry.get("exp_id"))
-    model_type = _clean_optional(entry.get("model_type"))
-    if not exp_id:
-        raise ValueError(f"Feature config deployment.{name} must define exp_id")
-    if not model_type:
-        raise ValueError(f"Feature config deployment.{name} must define model_type")
+    exp_id = _clean_optional(registry_alias.get("exp_id"))
+    model_type = _clean_optional(registry_alias.get("model_type"))
+    missing = [key for key, value in {"exp_id": exp_id, "model_type": model_type}.items() if not value]
+    if missing:
+        raise ValueError(f"Registry alias {name!r} missing required field(s): {missing}")
 
     return {
         "alias": name,
-        "run_id": run_id,
         "exp_id": exp_id,
         "model_type": model_type,
-        "model_date": _clean_optional(entry.get("model_date")),
+        "model_date": _clean_optional(registry_alias.get("model_date")),
         "prediction_threshold": _parse_prediction_threshold(
-            entry.get("prediction_threshold"),
-            f"deployment.{name}.prediction_threshold",
+            registry_alias.get("prediction_threshold"),
+            f"registry alias {name}.prediction_threshold",
         ),
-        "source": "github_config",
+        "source": "model_registry",
     }
 
 
-def load_deployment_aliases(feature_config_path: str | Path | None) -> tuple[dict, dict | None]:
-    config = load_feature_config(feature_config_path)
-    production = _deployment_alias_from_config(config, "production")
-    shadow = _deployment_alias_from_config(config, "shadow")
+def load_deployment_aliases(spark) -> tuple[dict, dict | None]:
+    production = _deployment_alias_from_registry(spark, "production")
+    shadow = _deployment_alias_from_registry(spark, "shadow")
     if not production:
-        raise ValueError("Feature config must define deployment.production.run_id")
-    logger.info("Using Git-configured production model run: %s", production["run_id"])
+        raise ValueError("Registry alias 'production' is not set")
+    logger.info("Using %s production experiment: %s", production["source"], production["exp_id"])
     if shadow:
-        logger.info("Using Git-configured shadow model run: %s", shadow["run_id"])
+        logger.info("Using %s shadow experiment: %s", shadow["source"], shadow["exp_id"])
     return production, shadow
 
 
@@ -179,19 +116,13 @@ def _resolve_feature_input_paths(
     input_path: str | None,
     use_shadow: bool,
 ) -> dict[str, str]:
-    configured = paths.get("feature_input_paths") or {}
-    configured_production_input = paths["input"] if paths.get("input_configured") else None
     resolved = {
-        "production": input_path or configured.get("production") or configured_production_input or _default_feature_input_path(paths, batch_id, "production"),
+        "production": input_path or _default_feature_input_path(paths, batch_id, "production"),
     }
-    # When no legacy/custom input is set, default production to the deployment-specific
-    # table emitted by assemble_inference_features.py.
-    if not input_path and not configured.get("production") and not configured_production_input:
-        resolved["production"] = _default_feature_input_path(paths, batch_id, "production")
     if use_shadow:
-        if input_path and not configured.get("shadow"):
-            raise ValueError("Shadow deployment requires features.input_paths.shadow when --input-path overrides production features")
-        resolved["shadow"] = configured.get("shadow") or _default_feature_input_path(paths, batch_id, "shadow")
+        if input_path:
+            raise ValueError("Shadow deployment cannot use a single --input-path; assemble deployment-specific features instead")
+        resolved["shadow"] = _default_feature_input_path(paths, batch_id, "shadow")
     return resolved
 
 
@@ -199,14 +130,13 @@ def load_or_create_manifest(
     spark,
     batch_id: str,
     input_path: str | None,
-    feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH,
 ) -> dict:
-    paths = load_paths(feature_config_path)
+    paths = load_paths()
     manifest_path = f"{paths['output']}/{batch_id}/manifest.json"
     if hadoop_path_exists(spark, manifest_path):
         logger.info("Reusing manifest at %s", manifest_path)
         manifest = read_json(spark, manifest_path)
-        production, shadow = load_deployment_aliases(feature_config_path)
+        production, shadow = load_deployment_aliases(spark)
         if (
             manifest.get("production_model_config", {}).get("prediction_threshold")
             != production.get("prediction_threshold")
@@ -214,7 +144,7 @@ def load_or_create_manifest(
             != ((shadow or {}).get("prediction_threshold"))
         ):
             manifest["production_model_config"] = production
-            if manifest.get("shadow_run_id"):
+            if manifest.get("shadow_exp_id") or manifest.get("shadow_run_id"):
                 manifest["shadow_model_config"] = shadow
             manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
             write_json(spark, manifest_path, manifest, overwrite=True)
@@ -234,10 +164,10 @@ def load_or_create_manifest(
             write_json(spark, manifest_path, manifest, overwrite=True)
         return manifest
 
-    production, shadow = load_deployment_aliases(feature_config_path)
-    shadow_run_id = shadow["run_id"] if shadow else None
-    use_shadow = shadow_run_id is not None and shadow_run_id != production["run_id"]
-    if shadow_run_id and not use_shadow:
+    production, shadow = load_deployment_aliases(spark)
+    shadow_exp_id = shadow["exp_id"] if shadow else None
+    use_shadow = shadow_exp_id is not None and shadow_exp_id != production["exp_id"]
+    if shadow_exp_id and not use_shadow:
         logger.info("Shadow model matches production; scoring production only")
 
     feature_input_paths = _resolve_feature_input_paths(paths, batch_id, input_path, use_shadow)
@@ -256,8 +186,8 @@ def load_or_create_manifest(
         "predictions_path": f"{paths['output']}/{batch_id}/predictions",
         "validation_path": f"{paths['output']}/{batch_id}/validation.json",
         "published_predictions_path": paths["published_predictions"],
-        "production_run_id": production["run_id"],
-        "shadow_run_id": shadow_run_id if use_shadow else None,
+        "production_exp_id": production["exp_id"],
+        "shadow_exp_id": shadow_exp_id if use_shadow else None,
         "deployment_source": production["source"],
         "production_model_config": production,
         "shadow_model_config": shadow if use_shadow else None,
@@ -376,14 +306,14 @@ def _resolve_per_label_model_paths(spark, exp_id: str, manifest_path: str, per_l
     return resolved
 
 
-def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
+def _load_experiment_contract(spark, exp_id: str, model_config: dict) -> dict:
     exp_id = _clean_optional(model_config.get("exp_id"))
     model_type = _clean_optional(model_config.get("model_type"))
     model_date = _clean_optional(model_config.get("model_date"))
     if not exp_id:
-        raise ValueError(f"Model config for run {run_id} must define exp_id")
+        raise ValueError("Model config must define exp_id")
     if not model_type:
-        raise ValueError(f"Model config for run {run_id} must define model_type")
+        raise ValueError(f"Model config for {exp_id} must define model_type")
 
     manifest, manifest_path = load_training_manifest(
         spark,
@@ -400,13 +330,12 @@ def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
     threshold = model_config.get("prediction_threshold")
     threshold = float(threshold if threshold is not None else manifest.get("multilabel_threshold", 0.5))
     if not 0 <= threshold <= 1:
-        raise ValueError(f"Model config for run {run_id} has invalid prediction_threshold")
+        raise ValueError(f"Model config for {exp_id} has invalid prediction_threshold")
 
     labels = list(per_label_paths.keys())
     per_label_paths = _resolve_per_label_model_paths(spark, exp_id, manifest_path, per_label_paths)
     models = load_trained_models(per_label_paths, model_type)
     return {
-        "run_id": run_id,
         "exp_id": exp_id,
         "model_type": model_type,
         "model_manifest_path": manifest_path,
@@ -418,24 +347,24 @@ def _load_experiment_contract(spark, run_id: str, model_config: dict) -> dict:
     }
 
 
-def validate_model_run(spark, run_id: str, model_config: dict) -> dict:
+def validate_model_run(spark, exp_id: str, model_config: dict) -> dict:
     if not isinstance(model_config, dict):
-        raise ValueError(f"Batch manifest for run {run_id} missing model config; recreate the batch manifest from config YAML")
-    return _load_experiment_contract(spark, run_id, model_config)
+        raise ValueError(f"Batch manifest for {exp_id} missing model config; recreate the batch manifest")
+    return _load_experiment_contract(spark, exp_id, model_config)
 
 
 def validate_model_contracts(spark, manifest: dict) -> dict:
     contracts = {
         "production": validate_model_run(
             spark,
-            manifest["production_run_id"],
+            manifest.get("production_exp_id") or manifest.get("production_run_id"),
             manifest.get("production_model_config"),
         )
     }
-    if manifest.get("shadow_run_id"):
+    if manifest.get("shadow_exp_id") or manifest.get("shadow_run_id"):
         contracts["shadow"] = validate_model_run(
             spark,
-            manifest["shadow_run_id"],
+            manifest.get("shadow_exp_id") or manifest.get("shadow_run_id"),
             manifest.get("shadow_model_config"),
         )
         production_labels = set(contracts["production"]["labels"])
@@ -521,7 +450,7 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
 
     prediction_count = predictions.count()
     unique_count = predictions.select("document_id").distinct().count()
-    expected_prediction_count = input_count * (2 if manifest.get("shadow_run_id") else 1)
+    expected_prediction_count = input_count * (2 if (manifest.get("shadow_exp_id") or manifest.get("shadow_run_id")) else 1)
     if prediction_count != expected_prediction_count or unique_count != input_count:
         raise ValueError(f"Prediction coverage failed: input={input_count}, rows={prediction_count}, " f"unique_documents={unique_count}")
     if source.select("document_id").join(predictions.select("document_id"), "document_id", "left_anti").limit(1).count():
@@ -529,31 +458,31 @@ def validate_predictions(source, predictions, manifest: dict, input_count: int, 
     if predictions.select("document_id").join(source.select("document_id"), "document_id", "left_anti").limit(1).count():
         raise ValueError("Prediction output contains unexpected documents")
 
-    expected_runs = {
-        "production": manifest["production_run_id"],
-        "shadow": manifest.get("shadow_run_id"),
+    expected_models = {
+        "production": manifest.get("production_exp_id") or manifest.get("production_run_id"),
+        "shadow": manifest.get("shadow_exp_id") or manifest.get("shadow_run_id"),
     }
     counts = {}
-    for group, run_id in expected_runs.items():
-        if run_id is None:
+    for group, exp_id in expected_models.items():
+        if exp_id is None:
             counts[group] = 0
             continue
         group_df = predictions.filter(F.col("deployment_group") == group)
         counts[group] = group_df.count()
-        if group_df.filter(F.col("model_run_id") != run_id).limit(1).count():
-            raise ValueError(f"{group} predictions use an unexpected model run")
+        if group_df.filter(F.col("model_run_id") != exp_id).limit(1).count():
+            raise ValueError(f"{group} predictions use an unexpected model")
 
         valid_labels = sorted(allowed_labels[group])
         invalid_labels = group_df.select(F.explode_outer("predicted_labels").alias("label")).filter(F.col("label").isNotNull() & ~F.col("label").isin(valid_labels))
         if invalid_labels.limit(1).count():
             raise ValueError(f"{group} predictions contain labels outside the model mapping")
 
-    if predictions.filter(~F.col("deployment_group").isin([group for group, run_id in expected_runs.items() if run_id])).limit(1).count():
+    if predictions.filter(~F.col("deployment_group").isin([group for group, exp_id in expected_models.items() if exp_id])).limit(1).count():
         raise ValueError("Prediction output contains an unexpected deployment_group")
 
     if counts["production"] != input_count:
         raise ValueError("Production count does not match the input size")
-    expected_shadow = input_count if manifest.get("shadow_run_id") else 0
+    expected_shadow = input_count if (manifest.get("shadow_exp_id") or manifest.get("shadow_run_id")) else 0
     if counts["shadow"] != expected_shadow:
         raise ValueError(f"Shadow count mismatch: expected={expected_shadow}, actual={counts['shadow']}")
 
@@ -598,11 +527,10 @@ def run_batch(
     spark,
     batch_id: str,
     input_path: str | None = None,
-    feature_config_path: str | Path | None = DEFAULT_FEATURE_CONFIG_PATH,
 ) -> str:
     from pyspark.sql import functions as F
 
-    manifest = load_or_create_manifest(spark, batch_id, input_path, feature_config_path)
+    manifest = load_or_create_manifest(spark, batch_id, input_path)
     contracts = validate_model_contracts(spark, manifest)
     manifest["prediction_thresholds"] = {
         group: contract["threshold"]
@@ -614,9 +542,9 @@ def run_batch(
             "Manifest for batch %s has no input_version; reading the latest Delta version",
             batch_id,
         )
-    groups = [("production", manifest["production_run_id"])]
-    if manifest.get("shadow_run_id"):
-        groups.append(("shadow", manifest["shadow_run_id"]))
+    groups = [("production", manifest.get("production_exp_id") or manifest.get("production_run_id"))]
+    if manifest.get("shadow_exp_id") or manifest.get("shadow_run_id"):
+        groups.append(("shadow", manifest.get("shadow_exp_id") or manifest.get("shadow_run_id")))
 
     sources = {}
     counts = {}
@@ -638,7 +566,7 @@ def run_batch(
 
     outputs = []
     allowed_labels = {}
-    for group, run_id in groups:
+    for group, exp_id in groups:
         cohort = assign_deployment_group(sources[group], group)
         scored = score_cohort(cohort, contracts[group])
         allowed_labels[group] = set(contracts[group]["labels"])
@@ -646,7 +574,7 @@ def run_batch(
             scored.select(
                 F.lit(batch_id).alias("batch_id"),
                 "document_id",
-                F.lit(run_id).alias("model_run_id"),
+                F.lit(exp_id).alias("model_run_id"),
                 "deployment_group",
                 "predicted_labels",
                 F.current_timestamp().alias("prediction_timestamp"),
@@ -669,12 +597,12 @@ def run_batch(
     )
     published_path = manifest.get(
         "published_predictions_path",
-        load_paths(feature_config_path)["published_predictions"],
+        load_paths()["published_predictions"],
     )
     publish_predictions(spark, predictions, published_path)
     validation_path = manifest.get(
         "validation_path",
-        f"{load_paths(feature_config_path)['output']}/{batch_id}/validation.json",
+        f"{load_paths()['output']}/{batch_id}/validation.json",
     )
     write_json(spark, validation_path, validation, overwrite=True)
     logger.info("Wrote predictions to %s", manifest["predictions_path"])
@@ -687,7 +615,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run batch shadow inference")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--batch-id", required=True)
-    parser.add_argument("--feature-config", default=str(DEFAULT_FEATURE_CONFIG_PATH))
     parser.add_argument("--input-path")
     args = parser.parse_args()
 
@@ -705,7 +632,6 @@ def main() -> None:
             spark,
             args.batch_id,
             args.input_path,
-            args.feature_config,
         )
         print(json.dumps({"published_predictions_path": published_path}, indent=2))
     finally:

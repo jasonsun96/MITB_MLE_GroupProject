@@ -5,13 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+from gold_io import PARTITION_COL, bootstrap_paths, write_delta
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from sklearn.preprocessing import MultiLabelBinarizer
-from utils.spark_session import create_spark_session
 
-from gold_io import PARTITION_COL, bootstrap_paths, write_delta
+from utils.spark_session import create_spark_session
 
 bootstrap_paths()
 

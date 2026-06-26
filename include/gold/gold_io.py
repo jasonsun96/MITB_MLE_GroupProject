@@ -1,5 +1,3 @@
-"""Shared Delta I/O helpers for gold and model-bank jobs."""
-
 import json
 import pickle
 import sys

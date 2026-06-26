@@ -1,10 +1,3 @@
-"""Assemble deployment-specific inference feature tables from Gold corpus tables.
-
-This applies frozen feature artifacts from model_bank/features/{feature_run_id}
-to documents marked with category='inference' in gold/label_store. It does not
-refit TF-IDF or DCW statistics.
-"""
-
 import argparse
 import logging
 import sys
@@ -23,6 +16,7 @@ for _path in (_PROJECT_ROOT, _INCLUDE_DIR, _GOLD_DIR):
 
 import yaml
 from gold_io import load_pickle
+from include.inference.model_registry import get_alias, load_registry_paths
 from model_pipeline.multilabel_core import (DCW_FEATURES_COL, DOCUMENT_ID_COL,
                                             EMBEDDING_COL,
                                             EMBEDDING_VECTOR_COL, FEATURES_COL,
@@ -42,8 +36,7 @@ from tfidf_processing import add_tfidf_column, load_tfidf_artifact
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INFERENCE_CATEGORY = "inference"
-DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "batch_inference.yaml"
+DEFAULT_INFERENCE_CATEGORIES = ("production_unlabelled", "production_labelled")
 
 
 def _clean_optional(value: Any) -> str | None:
@@ -53,25 +46,6 @@ def _clean_optional(value: Any) -> str | None:
     return text or None
 
 
-def load_assembly_config(config_path: str | Path | None) -> dict[str, Any]:
-    if not config_path:
-        return {}
-
-    path = Path(config_path)
-    if not path.is_absolute():
-        path = _PROJECT_ROOT / path
-    if not path.exists():
-        raise FileNotFoundError(f"Feature assembly config not found: {path}")
-
-    with path.open() as f:
-        config = yaml.safe_load(f) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"Feature assembly config must be a YAML mapping: {path}")
-
-    logger.info("Loaded feature assembly config from %s", path)
-    return config
-
-
 def _manifest_value(manifest: dict[str, Any], key: str) -> str | None:
     value = manifest.get(key)
     if value is None:
@@ -79,38 +53,28 @@ def _manifest_value(manifest: dict[str, Any], key: str) -> str | None:
     return str(value).strip() or None
 
 
-def _deployment_model_configs(config: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    deployment_config = config.get("deployment") or {}
-    if not isinstance(deployment_config, dict):
-        raise ValueError("Feature assembly config field 'deployment' must be a mapping")
-    production_config = deployment_config.get("production") or {}
-    if not isinstance(production_config, dict) or not production_config:
-        raise ValueError("Feature assembly config must define deployment.production")
-    contexts = [("production", production_config)]
-
-    shadow_config = deployment_config.get("shadow")
-    if shadow_config is not None:
-        if not isinstance(shadow_config, dict):
-            raise ValueError("Feature assembly config field 'deployment.shadow' must be a mapping")
-        if shadow_config.get("enabled") is not False:
-            shadow_run_id = _clean_optional(shadow_config.get("run_id")) or _clean_optional(shadow_config.get("exp_id"))
-            production_run_id = _clean_optional(production_config.get("run_id")) or _clean_optional(production_config.get("exp_id"))
-            if not shadow_run_id and shadow_config.get("enabled") is True:
-                raise ValueError("Feature assembly config deployment.shadow must define run_id when enabled")
-            if shadow_run_id and shadow_run_id != production_run_id:
-                contexts.append(("shadow", shadow_config))
-    return contexts
+def _registry_model_config(spark, alias: str, *, required: bool) -> dict[str, Any] | None:
+    registry_alias = get_alias(spark, load_registry_paths(), alias)
+    if not registry_alias:
+        if required:
+            raise ValueError(f"Registry alias {alias!r} is not set")
+        return None
+    return {
+        "exp_id": registry_alias.get("exp_id"),
+        "model_type": registry_alias.get("model_type"),
+        "model_date": registry_alias.get("model_date"),
+        "prediction_threshold": registry_alias.get("prediction_threshold"),
+        "source": "model_registry",
+    }
 
 
 def _resolve_model_context(
     spark,
     alias: str,
     model_config: dict[str, Any],
-    feature_config: dict[str, Any],
     category: str | None,
 ) -> dict[str, Any]:
     """Resolve model-selected feature inputs for one deployment alias."""
-    run_id = _clean_optional(model_config.get("run_id")) or _clean_optional(model_config.get("exp_id"))
     exp_id = _clean_optional(model_config.get("exp_id"))
     model_type = _clean_optional(model_config.get("model_type"))
     model_date = _clean_optional(model_config.get("model_date"))
@@ -118,9 +82,9 @@ def _resolve_model_context(
     manifest: dict[str, Any] | None = None
     manifest_path: str | None = None
     if not exp_id:
-        raise ValueError(f"Feature assembly config deployment.{alias} must define exp_id")
+        raise ValueError(f"Registry alias {alias!r} must define exp_id")
     if not model_type:
-        raise ValueError(f"Feature assembly config deployment.{alias} must define model_type")
+        raise ValueError(f"Registry alias {alias!r} must define model_type")
     manifest, manifest_path = load_training_manifest(spark, exp_id, model_date, model_type=model_type)
 
     feature_run_id = _manifest_value(manifest or {}, "feature_run_id")
@@ -130,19 +94,10 @@ def _resolve_model_context(
     if not feature_set:
         raise ValueError(f"Model manifest for {exp_id!r} must define feature_set")
 
-    gold_run_ids = feature_config.get("gold_run_ids") or {}
-    if gold_run_ids and not isinstance(gold_run_ids, dict):
-        raise ValueError("Feature assembly config field 'features.gold_run_ids' must be a mapping")
-    gold_run_id = (
-        _clean_optional(gold_run_ids.get(alias))
-        or _clean_optional(feature_config.get("gold_run_id"))
-        or _manifest_value(manifest or {}, "gold_run_id")
-        or feature_run_id
-    )
+    gold_run_id = _manifest_value(manifest or {}, "gold_run_id") or feature_run_id
 
     return {
         "alias": alias,
-        "run_id": run_id,
         "exp_id": exp_id,
         "model_type": model_type or _manifest_value(manifest or {}, "model_type"),
         "model_date": model_date,
@@ -151,41 +106,28 @@ def _resolve_model_context(
         "gold_run_id": gold_run_id,
         "feature_set": feature_set,
         "category": category,
+        "source": model_config.get("source", "model_registry"),
     }
 
 
 def resolve_feature_assembly_contexts(spark, args: argparse.Namespace) -> list[dict[str, Any]]:
     """Resolve model-selected feature inputs for production and optional shadow."""
-    config = load_assembly_config(args.config)
-    feature_config = config.get("features") or {}
-    if not isinstance(feature_config, dict):
-        raise ValueError("Feature assembly config field 'features' must be a mapping")
-
-    categories = feature_config.get("categories")
-    if categories is not None:
-        if not isinstance(categories, list) or not all(_clean_optional(category) for category in categories):
-            raise ValueError("Feature assembly config field 'features.categories' must be a non-empty list of category names")
-        resolved_categories = [_clean_optional(category) for category in categories]
-    else:
-        resolved_categories = [_clean_optional(feature_config.get("category")) or _clean_optional(args.category) or DEFAULT_INFERENCE_CATEGORY]
+    categories = args.categories or list(DEFAULT_INFERENCE_CATEGORIES)
+    aliases = [("production", _registry_model_config(spark, "production", required=True))]
+    shadow = _registry_model_config(spark, "shadow", required=False)
+    if shadow and shadow.get("exp_id") != aliases[0][1].get("exp_id"):
+        aliases.append(("shadow", shadow))
 
     contexts = [
-        _resolve_model_context(spark, alias, model_config, feature_config, category)
-        for alias, model_config in _deployment_model_configs(config)
-        for category in resolved_categories
+        _resolve_model_context(spark, alias, model_config, category)
+        for alias, model_config in aliases
+        if model_config
+        for category in categories
     ]
     return contexts
 
 
-def load_batch_feature_base(config_path: str | Path | None, batch_id: str) -> str:
-    config = load_assembly_config(config_path)
-    feature_config = config.get("features") or {}
-    if not isinstance(feature_config, dict):
-        raise ValueError("Feature assembly config field 'features' must be a mapping")
-    output_base = feature_config.get("output_base")
-    if output_base:
-        return str(output_base).rstrip("/")
-
+def load_batch_feature_base(batch_id: str) -> str:
     with (_PROJECT_ROOT / "schema.yaml").open() as schema_file:
         schema = yaml.safe_load(schema_file)
     gold = schema["gold"]
@@ -364,8 +306,7 @@ def write_inference_features(df: DataFrame, path: str, batch_id: str | None, mod
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Assemble deployment-specific inference features from Gold corpus features")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
-    parser.add_argument("--category", default=DEFAULT_INFERENCE_CATEGORY)
+    parser.add_argument("--categories", nargs="+", default=list(DEFAULT_INFERENCE_CATEGORIES))
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
@@ -380,7 +321,7 @@ def main() -> None:
     spark = create_pipeline_spark_session("assemble-inference-features")
     try:
         contexts = resolve_feature_assembly_contexts(spark, args)
-        feature_base = load_batch_feature_base(args.config, args.batch_id)
+        feature_base = load_batch_feature_base(args.batch_id)
         contexts_by_alias: dict[str, list[dict[str, Any]]] = {}
         for context in contexts:
             contexts_by_alias.setdefault(context["alias"], []).append(context)

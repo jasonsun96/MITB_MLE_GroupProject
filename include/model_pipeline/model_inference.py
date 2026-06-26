@@ -1,5 +1,3 @@
-"""Holdout inference and evaluation for trained multi-label models."""
-
 import argparse
 from datetime import datetime, timezone
 from typing import Any

@@ -1,24 +1,3 @@
-"""
-Gold n-gram counts for the legal corpus.
-
-Reads legal silver, tokenizes with NLTK (stopwords + lemmatization), and writes
-per-document raw n-gram count maps to gold. No corpus vocabulary is fitted here;
-TF-IDF vocabulary/IDF fitting happens later in a separate model-bank job on
-train data only.
-
-schema (gold/ngrams):
-  document_id, labels, snapshot_date
-  tokens, token_count
-  ngram_counts: {ngram_string: count}   e.g. {"sample": 2, "sample text": 1}
-  text_source, silver_ingest_ts, silver_source
-
-notes:
-  - regular UDF (not pandas_udf) for Python worker compatibility
-  - NLTK loaded once per Python worker (module-level singleton)
-  - text capped at 500k chars at Spark level before tokenization
-  - repartition by snapshot_date so partitionBy on write lines up with shuffle
-"""
-
 import argparse
 import logging
 import re
@@ -26,11 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from gold_io import bootstrap_paths
 from pyspark.sql import functions as F
 from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
                                StructType)
-
-from gold_io import bootstrap_paths
 
 bootstrap_paths()
 

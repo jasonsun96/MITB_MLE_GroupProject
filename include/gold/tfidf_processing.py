@@ -1,37 +1,16 @@
-"""
-TF-IDF feature freezing for the legal corpus.
-
-Reads precomputed Gold n-gram counts, joins the Gold labels/split table, fits
-vocabulary and IDF on train documents only, applies the frozen artifact to all
-splits, and writes TF-IDF + log-TF-IDF feature tables plus model_bank artefacts.
-
-Log-TF-IDF weighting: log(tf) × (1 + log(idf)) using frozen train IDF values.
-
-Upstream:  gold/ngrams        (run ngram_processing.py first)
-Split:      gold/labels        (document_id, category)
-Outputs:    gold/runs/{run_id}/tfidf_train
-            gold/runs/{run_id}/tfidf_val_test_oot
-            model_bank/runs/{run_id}/feature_extractors/tfidf.pkl
-
-notes:
-  - vocabulary and IDF are learned from category == "train" only
-  - val/test/oot never influence vocab selection or IDF
-  - --no-split treats all ngram_count rows as train (smoke tests only)
-"""
-
 import argparse
 import logging
 import math
 from datetime import datetime, timezone
 
+from gold_io import (PARTITION_COL, bootstrap_paths, columns_with_snapshot,
+                     load_pickle, save_json, save_pickle, write_delta)
 from pyspark.ml.linalg import Vector, Vectors, VectorUDT
 from pyspark.sql import functions as F
 from pyspark.sql.functions import udf
-from utils.spark_session import create_spark_session
-
-from gold_io import (PARTITION_COL, bootstrap_paths, columns_with_snapshot,
-                     load_pickle, save_json, save_pickle, write_delta)
 from run_paths import default_feature_run_id, resolve_feature_run_paths
+
+from utils.spark_session import create_spark_session
 
 bootstrap_paths()
 

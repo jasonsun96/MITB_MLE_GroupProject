@@ -1,25 +1,3 @@
-"""
-gold POS counts for the legal corpus.
-
-reads legal silver, runs spaCy POS tagging, writes lemma counts grouped by
-POS tag to gold. anyone downstream (Yuhui's DP/DC, noun-only stuff, whatever)
-just reads this and filters to the POS tags they need.
-
-schema:
-  document_id, labels, snapshot_date
-  pos_counts: {pos_tag: {lemma: count}}    e.g. {"NOUN": {"sample": 29, ...}, "VERB": {...}}
-  n_unique_tokens, n_total_tokens
-
-to pull nouns + proper nouns (the DP/DC use case):
-  nouns = {**row.pos_counts.get("NOUN", {}), **row.pos_counts.get("PROPN", {})}
-
-notes:
-  - regular UDF instead of pandas_udf, otherwise arrow blows up on java 17
-  - spacy loaded once per python worker (module-level singleton)
-  - parser and ner disabled, we only need POS
-  - text capped at 500k chars before tagging to keep python worker memory bounded
-"""
-
 import argparse
 import logging
 from pathlib import Path
@@ -28,6 +6,7 @@ import pyspark.sql.functions as F
 import yaml
 from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
                                StructType)
+
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: POS-tagged lemma counts")

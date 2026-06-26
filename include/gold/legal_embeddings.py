@@ -1,26 +1,3 @@
-"""
-gold Legal-BERT embeddings for the legal corpus.
-
-reads legal bronze, tokenises into chunks of 510 tokens (capped at 5 chunks
-per doc to bound runtime on the long tail), forward-passes each chunk through
-nlpaueb/legal-bert-base-uncased, mean-pools per chunk, then averages chunk
-vectors into one 768-dim doc vector.
-
-schema:
-  document_id, labels, snapshot_date
-  embedding: array<float>     (768 floats per doc)
-  embedding_model: string     (which model produced this, useful if we add more)
-
-notes:
-  - chunk-and-pool because BERT max input is 512 tokens (architectural limit,
-    can't be bypassed without switching to longformer or similar)
-  - 5-chunk cap covers everything below p95 of the corpus (~3000 words = ~9 chunks)
-    while bounding wall time
-  - BERT loaded once per python worker (module-level singleton, same pattern as POS)
-  - text capped at 500k chars before tokenising. would never reach this in
-    practice with the 5-chunk cap but keeps the spark side memory bounded
-"""
-
 import argparse
 import logging
 from pathlib import Path
@@ -29,6 +6,7 @@ import pyspark.sql.functions as F
 import yaml
 from pyspark.sql.types import (ArrayType, FloatType, IntegerType, StringType,
                                StructField, StructType)
+
 from utils.spark_session import create_spark_session
 
 parser = argparse.ArgumentParser(description="Gold layer: Legal-BERT embeddings (legal)")
