@@ -1,32 +1,11 @@
-"""
-gold Legal-BERT embeddings for the legal corpus.
-
-reads legal bronze, tokenises into chunks of 510 tokens (capped at 5 chunks
-per doc to bound runtime on the long tail), forward-passes each chunk through
-nlpaueb/legal-bert-base-uncased, mean-pools per chunk, then averages chunk
-vectors into one 768-dim doc vector.
-
-schema:
-  document_id, labels, snapshot_date
-  embedding: array<float>     (768 floats per doc)
-  embedding_model: string     (which model produced this, useful if we add more)
-
-notes:
-  - chunk-and-pool because BERT max input is 512 tokens (architectural limit,
-    can't be bypassed without switching to longformer or similar)
-  - 5-chunk cap covers everything below p95 of the corpus (~3000 words = ~9 chunks)
-    while bounding wall time
-  - BERT loaded once per python worker (module-level singleton, same pattern as POS)
-  - text capped at 500k chars before tokenising. would never reach this in
-    practice with the 5-chunk cap but keeps the spark side memory bounded
-"""
 import argparse
 import logging
 from pathlib import Path
 
 import pyspark.sql.functions as F
 import yaml
-from pyspark.sql.types import ArrayType, FloatType, StringType, StructField, StructType, IntegerType
+from pyspark.sql.types import (ArrayType, FloatType, IntegerType, StringType,
+                               StructField, StructType)
 
 from utils.spark_session import create_spark_session
 
@@ -46,6 +25,11 @@ parser.add_argument(
     "--input-layer",
     default="silver",
     choices=["bronze", "silver"],
+)
+parser.add_argument(
+    "--snapshot-date",
+    default=None,
+    help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
 )
 args = parser.parse_args()
 
@@ -74,8 +58,8 @@ logger.info(f"Output (gold)             : {OUTPUT_PATH}")
 
 MODEL_NAME = "nlpaueb/legal-bert-base-uncased"
 EMBEDDING_DIM = 768
-CHUNK_TOKENS = 510    # 512 minus room for [CLS] and [SEP]
-MAX_CHUNKS = 5        # cap per doc to bound runtime on the long tail
+CHUNK_TOKENS = 510  # 512 minus room for [CLS] and [SEP]
+MAX_CHUNKS = 5  # cap per doc to bound runtime on the long tail
 
 # UDF output: the embedding vector + the model name (so we can stack multiple
 # embedding models in the same table later if we want to compare)
@@ -163,9 +147,9 @@ def _embed_document(text):
         mask = attention_mask.unsqueeze(-1).float()
         summed = (hidden * mask).sum(dim=1)
         counts = mask.sum(dim=1).clamp(min=1)
-        chunk_vectors = summed / counts          # (n_chunks, 768)
+        chunk_vectors = summed / counts  # (n_chunks, 768)
         # average across chunks
-        doc_vector = chunk_vectors.mean(dim=0).cpu()   # (768,) back to host
+        doc_vector = chunk_vectors.mean(dim=0).cpu()  # (768,) back to host
         return {
             "embedding": doc_vector.tolist(),
             "embedding_model": MODEL_NAME,
@@ -183,17 +167,24 @@ def main():
     spark = create_spark_session("gold-legal-embeddings")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col("snapshot_date") == F.lit(args.snapshot_date))
+        logger.info("Scoped legal embeddings extraction to snapshot_date=%s", args.snapshot_date)
 
     # truncate doc text at spark level. with 5-chunk cap on the python side
     # we'd never use more than ~2500 chars worth of text anyway
     MAX_TEXT_CHARS = 500_000
 
-    df = raw.select(
+    select_exprs = [
         F.col("CELEX").alias("document_id"),
         F.substring(F.col(TEXT_COL), 1, MAX_TEXT_CHARS).alias("text"),
         F.col("labels").alias("labels"),
         F.col("snapshot_date").alias("snapshot_date"),
-    ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
+    ]
+    if "batch_id" in raw.columns:
+        select_exprs.append(F.col("batch_id"))
+
+    df = raw.select(*select_exprs).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
         df = df.limit(args.limit)
@@ -204,31 +195,23 @@ def main():
     df = df.repartition(32, "snapshot_date")
 
     input_count = df.count()
-    logger.info(
-        f"Processing {input_count:,} documents across "
-        f"{df.rdd.getNumPartitions()} partitions"
-    )
+    logger.info(f"Processing {input_count:,} documents across " f"{df.rdd.getNumPartitions()} partitions")
 
     # run the udf, then flatten the struct cols back to top-level
-    result = (
-        df.withColumn("_emb", embed_udf(F.col("text")))
-          .select(
-              F.col("document_id"),
-              F.col("labels"),
-              F.col("snapshot_date"),
-              F.col("_emb.embedding").alias("embedding"),
-              F.col("_emb.embedding_model").alias("embedding_model"),
-              F.col("_emb.n_chunks").alias("n_chunks"),
-          )
+    result = df.withColumn("_emb", embed_udf(F.col("text"))).select(
+        F.col("document_id"),
+        F.col("labels"),
+        F.col("snapshot_date"),
+        *([F.col("batch_id")] if "batch_id" in df.columns else []),
+        F.col("_emb.embedding").alias("embedding"),
+        F.col("_emb.embedding_model").alias("embedding_model"),
+        F.col("_emb.n_chunks").alias("n_chunks"),
     )
 
-    (
-        result.write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .partitionBy("snapshot_date")
-        .save(OUTPUT_PATH)
-    )
+    writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"snapshot_date = '{args.snapshot_date}'")
+    writer.partitionBy("snapshot_date").save(OUTPUT_PATH)
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

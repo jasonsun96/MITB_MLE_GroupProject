@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import logging
 from collections import Counter
@@ -23,6 +21,8 @@ LABEL_STORE_TABLE = "label_store"
 ID_COLUMN = "CELEX"
 LABEL_COLUMN = "labels"
 SPLIT_COLUMN = "category"
+PRODUCTION_UNLABELLED_CATEGORY = "production_unlabelled"
+PRODUCTION_LABELLED_CATEGORY = "production_labelled"
 DEFAULT_OOT_START_YEAR = 2004
 HOLDOUT_FRACTION_OF_PRE_OOT = 3 / 10
 TEST_FRACTION_OF_HOLDOUT = 1 / 3
@@ -40,16 +40,24 @@ def build_label_store(df):
     if missing_columns:
         raise ValueError(f"Required column(s) missing from silver input: {sorted(missing_columns)}")
 
+    labels_trimmed = F.trim(F.col("_raw_labels"))
+    select_exprs = [
+        F.trim(F.col(ID_COLUMN)).alias("document_id"),
+        F.col(PARTITION_COL),
+        F.col(LABEL_COLUMN).alias("_raw_labels"),
+    ]
+    if "batch_id" in df.columns:
+        select_exprs.append(F.col("batch_id"))
+
     return (
-        df.select(
-            F.trim(F.col(ID_COLUMN)).alias("document_id"),
-            F.col(PARTITION_COL),
-            F.trim(F.col(LABEL_COLUMN)).alias(LABEL_COLUMN),
+        df.select(*select_exprs)
+        .withColumn(
+            LABEL_COLUMN,
+            F.when(labels_trimmed.isNotNull() & (F.length(labels_trimmed) > 0), labels_trimmed).otherwise(F.lit(None).cast(T.StringType())),
         )
+        .drop("_raw_labels")
         .filter(F.col("document_id").isNotNull())
         .filter(F.length(F.col("document_id")) > 0)
-        .filter(F.col(LABEL_COLUMN).isNotNull())
-        .filter(F.length(F.col(LABEL_COLUMN)) > 0)
     )
 
 
@@ -87,9 +95,7 @@ def split_pre_oot_documents(rows, random_seed: int):
         test_size=TEST_FRACTION_OF_HOLDOUT,
         random_state=random_seed + 1,
     )
-    validation_relative, test_relative = next(
-        validation_test_splitter.split(holdout_row_indexes, holdout_targets)
-    )
+    validation_relative, test_relative = next(validation_test_splitter.split(holdout_row_indexes, holdout_targets))
     validation_indexes = holdout_indexes[validation_relative]
     test_indexes = holdout_indexes[test_relative]
 
@@ -111,16 +117,24 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
         sample = [row.snapshot_date for row in invalid_dates]
         raise ValueError(f"Invalid snapshot_date values: {sample}")
 
-    pre_oot = label_store.filter(snapshot_year < oot_start_year)
-    oot = label_store.filter(snapshot_year >= oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
+    has_labels = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
+    labelled = label_store.filter(has_labels)
+    production_unlabelled = label_store.filter(~has_labels).withColumn(SPLIT_COLUMN, F.lit(PRODUCTION_UNLABELLED_CATEGORY))
+
+    if labelled.limit(1).count() == 0:
+        logger.info("No labelled documents found; assigning all rows to category=%s", PRODUCTION_UNLABELLED_CATEGORY)
+        return production_unlabelled
+
+    pre_oot = labelled.filter(snapshot_year < oot_start_year)
+    oot = labelled.filter(snapshot_year == oot_start_year).withColumn(SPLIT_COLUMN, F.lit("oot"))
+    production_labelled = labelled.filter(snapshot_year > oot_start_year).withColumn(SPLIT_COLUMN, F.lit(PRODUCTION_LABELLED_CATEGORY))
 
     pre_oot_rows = pre_oot.select("document_id", LABEL_COLUMN).orderBy("document_id").collect()
     if not pre_oot_rows:
-        raise ValueError("No pre-OOT documents available for train/validation/test splitting")
+        logger.info("No pre-OOT documents available; returning OOT/production-labelled/production-unlabelled split assignment")
+        return oot.unionByName(production_labelled).unionByName(production_unlabelled)
 
-    assignments, stratified_label_count = split_pre_oot_documents(
-        pre_oot_rows, random_seed=random_seed
-    )
+    assignments, stratified_label_count = split_pre_oot_documents(pre_oot_rows, random_seed=random_seed)
     assignment_schema = T.StructType(
         [
             T.StructField("document_id", T.StringType(), nullable=False),
@@ -135,7 +149,7 @@ def assign_splits(label_store, spark, random_seed: int, oot_start_year: int):
         f"{stratified_label_count:,}",
         f"{len(pre_oot_rows):,}",
     )
-    return train_validation_test.unionByName(oot)
+    return train_validation_test.unionByName(oot).unionByName(production_labelled).unionByName(production_unlabelled)
 
 
 def main() -> None:
@@ -156,6 +170,11 @@ def main() -> None:
         type=int,
         default=DEFAULT_OOT_START_YEAR,
         help="First snapshot year assigned to the out-of-time set",
+    )
+    parser.add_argument(
+        "--snapshot-date",
+        default=None,
+        help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
     )
     args = parser.parse_args()
 
@@ -178,6 +197,9 @@ def main() -> None:
 
     spark = create_spark_session("gold-label-store")
     silver_df = spark.read.format("delta").load(input_path)
+    if args.snapshot_date:
+        silver_df = silver_df.filter(F.col(PARTITION_COL) == F.lit(args.snapshot_date))
+        logger.info("Scoped label store extraction to snapshot_date=%s", args.snapshot_date)
     label_store = build_label_store(silver_df)
     label_store = assign_splits(
         label_store,
@@ -187,7 +209,12 @@ def main() -> None:
     )
 
     try:
-        write_delta(label_store, output_path, partition_col=PARTITION_COL)
+        write_delta(
+            label_store,
+            output_path,
+            partition_col=PARTITION_COL,
+            replace_partition_value=args.snapshot_date,
+        )
     except Exception:
         logger.exception("Failed to write Gold label store to %s", output_path)
         raise

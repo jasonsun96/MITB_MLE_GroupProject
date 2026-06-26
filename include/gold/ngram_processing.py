@@ -1,25 +1,3 @@
-"""
-Gold n-gram counts for the legal corpus.
-
-Reads legal silver, tokenizes with NLTK (stopwords + lemmatization), and writes
-per-document raw n-gram count maps to gold. No corpus vocabulary is fitted here;
-TF-IDF vocabulary/IDF fitting happens later in a separate model-bank job on
-train data only.
-
-schema (gold/ngrams):
-  document_id, labels, snapshot_date
-  tokens, token_count
-  ngram_counts: {ngram_string: count}   e.g. {"sample": 2, "sample text": 1}
-  text_source, silver_ingest_ts, silver_source
-
-notes:
-  - regular UDF (not pandas_udf) for Python worker compatibility
-  - NLTK loaded once per Python worker (module-level singleton)
-  - text capped at 500k chars at Spark level before tokenization
-  - repartition by snapshot_date so partitionBy on write lines up with shuffle
-"""
-from __future__ import annotations
-
 import argparse
 import logging
 import re
@@ -27,10 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
-
 from gold_io import bootstrap_paths
+from pyspark.sql import functions as F
+from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
+                               StructType)
 
 bootstrap_paths()
 
@@ -170,6 +148,11 @@ def main():
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     )
+    parser.add_argument(
+        "--snapshot-date",
+        default=None,
+        help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -191,6 +174,9 @@ def main():
 
     spark = create_spark_session("gold-ngram-counts")
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col(PARTITION_COL) == F.lit(args.snapshot_date))
+        logger.info("Scoped n-gram extraction to snapshot_date=%s", args.snapshot_date)
 
     if ID_COLUMN not in raw.columns:
         raise ValueError(f"Required column missing from silver input: {ID_COLUMN}")
@@ -206,9 +192,9 @@ def main():
     ]
     if PARTITION_COL in raw.columns:
         select_exprs.insert(2, F.col(PARTITION_COL).alias(PARTITION_COL))
+    if "batch_id" in raw.columns:
+        select_exprs.insert(3 if PARTITION_COL in raw.columns else 2, F.col("batch_id"))
 
-    label_filter_raw = F.col(LABEL_COLUMN).isNotNull() & (F.length(F.col(LABEL_COLUMN)) > 0)
-    label_filter_selected = F.col("labels").isNotNull() & (F.length(F.col("labels")) > 0)
     text_filter = F.col("_text").isNotNull() & (F.length(F.trim(F.col("_text"))) > MIN_TEXT_CHARS)
 
     if args.limit:
@@ -220,36 +206,19 @@ def main():
         ]
         if PARTITION_COL in raw.columns:
             id_exprs.append(F.col(PARTITION_COL).alias(PARTITION_COL))
+        if "batch_id" in raw.columns:
+            id_exprs.append(F.col("batch_id"))
 
-        doc_ids = [
-            row.document_id
-            for row in (
-                raw.select(*id_exprs)
-                .filter(label_filter_raw)
-                .dropDuplicates(["document_id"])
-                .limit(args.limit)
-                .collect()
-            )
-        ]
+        doc_ids = [row.document_id for row in (raw.select(*id_exprs).filter(F.col(ID_COLUMN).isNotNull()).dropDuplicates(["document_id"]).limit(args.limit).collect())]
         if not doc_ids:
             raise ValueError("No documents matched smoke-test filters")
 
         logger.info("Smoke test mode: loading text for %s documents", f"{len(doc_ids):,}")
 
-        df = (
-            raw.filter(F.col(ID_COLUMN).isin(doc_ids))
-            .select(*select_exprs)
-            .filter(text_filter)
-            .filter(label_filter_selected)
-        )
+        df = raw.filter(F.col(ID_COLUMN).isin(doc_ids)).select(*select_exprs).filter(text_filter)
         input_count = len(doc_ids)
     else:
-        df = (
-            raw.filter(label_filter_raw)
-            .select(*select_exprs)
-            .filter(text_filter)
-            .dropDuplicates(["document_id"])
-        )
+        df = raw.select(*select_exprs).filter(text_filter).dropDuplicates(["document_id"])
         if PARTITION_COL in df.columns:
             df = df.repartition(REPARTITION_N, PARTITION_COL)
         input_count = df.count()
@@ -269,6 +238,7 @@ def main():
             F.col("document_id"),
             F.col("labels"),
             *([F.col(PARTITION_COL)] if PARTITION_COL in df.columns else []),
+            *([F.col("batch_id")] if "batch_id" in df.columns else []),
             F.col("_ngrams.tokens").alias("tokens"),
             F.col("_ngrams.token_count").alias("token_count"),
             F.col("_ngrams.ngram_counts").alias("ngram_counts"),
@@ -279,6 +249,8 @@ def main():
     )
 
     writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"{PARTITION_COL} = '{args.snapshot_date}'")
     if PARTITION_COL in result.columns:
         writer = writer.partitionBy(PARTITION_COL)
     writer.save(OUTPUT_PATH)

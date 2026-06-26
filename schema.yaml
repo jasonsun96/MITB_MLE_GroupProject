@@ -93,6 +93,9 @@ gold:
     date_partition_prefix: prediction_date=
     default_exp_id: null
 
+monitoring:
+  path: "s3a://cs611-project/monitoring"
+
 model_bank:
   path: "s3a://cs611-project/model_bank"
   features:

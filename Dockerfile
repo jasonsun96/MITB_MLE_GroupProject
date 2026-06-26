@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=10
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends default-jdk-headless procps \
@@ -20,12 +22,25 @@ ENV PYTHONPATH=/app:/app/include
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Resolve Spark's JVM dependencies at image build time. Airflow task containers
+# may not have outbound Maven access, so runtime Spark startup must use the
+# baked Ivy cache instead of downloading these jars on each task attempt.
+RUN python -c "from delta import configure_spark_with_delta_pip; \
+    from pyspark.sql import SparkSession; \
+    builder = SparkSession.builder.master('local[1]').appName('warm-spark-jars'); \
+    spark = configure_spark_with_delta_pip(builder, extra_packages=[ \
+        'org.apache.hadoop:hadoop-aws:3.3.4', \
+        'com.amazonaws:aws-java-sdk-bundle:1.12.262', \
+    ]).getOrCreate(); \
+    spark.stop()"
+
 # Install the small English spaCy model as a direct wheel. More reproducible
 # than `python -m spacy download` and works inside Docker build sandboxes
 # that block the spaCy CLI's download flow.
 # Swap URL to en_core_web_md or _trf later if accuracy on legal text is poor.
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --no-deps \
     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+RUN python -c "import numpy, spacy, thinc; print('numpy', numpy.__version__, 'spacy', spacy.__version__, 'thinc', thinc.__version__); spacy.load('en_core_web_sm')"
 
 # Bake NLTK corpora at build time. Runtime download from many Spark Python workers
 # races on the same zip and can corrupt stopwords (Bad CRC-32 / truncated header).

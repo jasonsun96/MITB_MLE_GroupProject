@@ -1,31 +1,11 @@
-"""
-gold POS counts for the legal corpus.
-
-reads legal silver, runs spaCy POS tagging, writes lemma counts grouped by
-POS tag to gold. anyone downstream (Yuhui's DP/DC, noun-only stuff, whatever)
-just reads this and filters to the POS tags they need.
-
-schema:
-  document_id, labels, snapshot_date
-  pos_counts: {pos_tag: {lemma: count}}    e.g. {"NOUN": {"sample": 29, ...}, "VERB": {...}}
-  n_unique_tokens, n_total_tokens
-
-to pull nouns + proper nouns (the DP/DC use case):
-  nouns = {**row.pos_counts.get("NOUN", {}), **row.pos_counts.get("PROPN", {})}
-
-notes:
-  - regular UDF instead of pandas_udf, otherwise arrow blows up on java 17
-  - spacy loaded once per python worker (module-level singleton)
-  - parser and ner disabled, we only need POS
-  - text capped at 500k chars before tagging to keep python worker memory bounded
-"""
 import argparse
 import logging
 from pathlib import Path
 
 import pyspark.sql.functions as F
 import yaml
-from pyspark.sql.types import IntegerType, MapType, StringType, StructField, StructType
+from pyspark.sql.types import (IntegerType, MapType, StringType, StructField,
+                               StructType)
 
 from utils.spark_session import create_spark_session
 
@@ -40,6 +20,11 @@ parser.add_argument(
     type=int,
     default=None,
     help="Limit to N rows for smoke testing. Omit for full corpus.",
+)
+parser.add_argument(
+    "--snapshot-date",
+    default=None,
+    help="Process and overwrite only this snapshot_date partition (YYYY-MM-DD).",
 )
 args = parser.parse_args()
 
@@ -60,10 +45,10 @@ SILVER_TABLES = SILVER["tables"]
 GOLD = schema["gold"]
 GOLD_PATH = GOLD["path"]
 
-INPUT_PATH  = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
+INPUT_PATH = f"{SILVER_PATH}/{SILVER_TABLES['legal_docs_processed']['path']}"
 OUTPUT_PATH = f"{GOLD_PATH}/{GOLD['corpus']['pos_tags']['path']}"
 # silver passes through bronze's column names, so still act_raw_text not text
-TEXT_COL    = "act_raw_text"
+TEXT_COL = "act_raw_text"
 
 logger.info(f"Input  (silver): {INPUT_PATH}")
 logger.info(f"Output (gold)  : {OUTPUT_PATH}")
@@ -144,18 +129,25 @@ def main():
     spark = create_spark_session("gold-pos-counts")
 
     raw = spark.read.format("delta").load(INPUT_PATH)
+    if args.snapshot_date:
+        raw = raw.filter(F.col("snapshot_date") == F.lit(args.snapshot_date))
+        logger.info("Scoped POS-count extraction to snapshot_date=%s", args.snapshot_date)
 
     # truncate doc text at spark level. 500k chars is well past p95 of the
     # corpus, so we lose ~nothing from real docs but cap the python worker
     # memory on outliers (some eurlex docs are 1.5M+ chars)
     MAX_TEXT_CHARS = 500_000
 
-    df = raw.select(
+    select_exprs = [
         F.col("CELEX").alias("document_id"),
         F.substring(F.col(TEXT_COL), 1, MAX_TEXT_CHARS).alias("text"),
         F.col("labels").alias("labels"),
         F.col("snapshot_date").alias("snapshot_date"),
-    ).filter(F.col("text").isNotNull() & (F.length("text") > 100))
+    ]
+    if "batch_id" in raw.columns:
+        select_exprs.append(F.col("batch_id"))
+
+    df = raw.select(*select_exprs).filter(F.col("text").isNotNull() & (F.length("text") > 100))
 
     if args.limit:
         df = df.limit(args.limit)
@@ -166,31 +158,27 @@ def main():
     df = df.repartition(200, "snapshot_date")
 
     input_count = df.count()
-    logger.info(
-        f"Processing {input_count:,} documents across "
-        f"{df.rdd.getNumPartitions()} partitions"
-    )
+    logger.info(f"Processing {input_count:,} documents across " f"{df.rdd.getNumPartitions()} partitions")
+    if input_count == 0:
+        logger.info("No documents matched POS-count filters; skipping write to %s", OUTPUT_PATH)
+        spark.stop()
+        return
 
     # run the udf, then flatten the struct cols back to top-level
-    result = (
-        df.withColumn("_pos", extract_pos_counts_udf(F.col("text")))
-          .select(
-              F.col("document_id"),
-              F.col("labels"),
-              F.col("snapshot_date"),
-              F.col("_pos.pos_counts").alias("pos_counts"),
-              F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
-              F.col("_pos.n_total_tokens").alias("n_total_tokens"),
-          )
+    result = df.withColumn("_pos", extract_pos_counts_udf(F.col("text"))).select(
+        F.col("document_id"),
+        F.col("labels"),
+        F.col("snapshot_date"),
+        *([F.col("batch_id")] if "batch_id" in df.columns else []),
+        F.col("_pos.pos_counts").alias("pos_counts"),
+        F.col("_pos.n_unique_tokens").alias("n_unique_tokens"),
+        F.col("_pos.n_total_tokens").alias("n_total_tokens"),
     )
 
-    (
-        result.write.format("delta")
-        .mode("overwrite")
-        .option("mergeSchema", "true")
-        .partitionBy("snapshot_date")
-        .save(OUTPUT_PATH)
-    )
+    writer = result.write.format("delta").mode("overwrite").option("mergeSchema", "true")
+    if args.snapshot_date:
+        writer = writer.option("replaceWhere", f"snapshot_date = '{args.snapshot_date}'")
+    writer.partitionBy("snapshot_date").save(OUTPUT_PATH)
 
     output_count = spark.read.format("delta").load(OUTPUT_PATH).count()
     logger.info(f"Wrote {output_count:,} rows to {OUTPUT_PATH}")

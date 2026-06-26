@@ -1,7 +1,3 @@
-"""Shared CLI arguments and runtime setup for training and inference entrypoints."""
-
-from __future__ import annotations
-
 import argparse
 import logging
 from typing import Any

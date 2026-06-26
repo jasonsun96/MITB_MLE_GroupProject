@@ -1,47 +1,34 @@
-"""Train multi-label Spark ML classifiers on precomputed Gold features."""
-from __future__ import annotations
-
 import argparse
-import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.sql import DataFrame
 
 from model_pipeline import cli as pipeline_cli
 from model_pipeline.multilabel_core import (
-    DEFAULT_FEATURE_IMPORTANCE_TOP_K,
     DOCUMENT_ID_COL,
     FEATURES_COL,
-    GRID_SEARCH_METRIC_CHOICES,
     LABEL_NORMALIZATION,
-    MODEL_TYPE_CHOICES,
     MULTILABEL_STRATEGY,
     SPLIT_COL,
     TARGET_LABELS_COL,
     _collect_training_labels,
     _compute_feature_importance_for_run,
-    _compute_multilabel_metrics,
     _default_param_grid,
-    _default_model_params,
     _feature_components,
     _global_top_score,
-    _iter_param_combos,
     _safe_label_name,
     _split_row_counts,
     build_feature_column,
     create_pipeline_spark_session,
-    default_feature_run_id,
     evaluate_multilabel,
     format_prediction_delta_df,
+    grid_search_hyperparameters,
     label_prob_column_map,
     load_dcw_vocab,
     load_features,
-    load_schema_paths,
     load_tfidf_vocab,
     logger,
-    model_bank_experiment_subdir,
     model_bank_feature_importance_path,
     model_bank_model_manifest_path,
     model_bank_per_label_models_dir,
@@ -50,133 +37,14 @@ from model_pipeline.multilabel_core import (
     prediction_delta_path,
     prepare_training_data,
     print_dry_run_summary,
-    resolve_exp_id,
     resolve_model_params,
     resolve_prediction_exp_id,
     save_json,
     save_pickle,
+    train_multilabel_model,
     write_delta,
 )
 from model_pipeline.multilabel_core import F
-
-def grid_search_hyperparameters(
-    model_type: str,
-    train_df: DataFrame,
-    val_df: DataFrame,
-    label_list: list[str],
-    threshold: float,
-    *,
-    metric: str = "micro_f1",
-    param_grid: dict[str, list[Any]] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Fit one binary classifier per label on train for each grid point; pick params by val score."""
-    if metric not in GRID_SEARCH_METRIC_CHOICES:
-        raise ValueError(f"Unsupported grid-search metric: {metric!r}")
-    if model_type not in MODEL_TYPE_CHOICES:
-        raise ValueError(f"Unsupported model_type for grid search: {model_type!r}")
-
-    grid = param_grid or _default_param_grid(model_type)
-    keys = list(_default_model_params(model_type).keys())
-    combos = _iter_param_combos(keys, grid, _default_model_params(model_type))
-    model_short = "LR" if model_type == "logistic_regression" else "RF"
-    logger.info(
-        "%s grid search: %s combinations on val split (%s rows, metric=%s)",
-        model_short,
-        f"{len(combos):,}",
-        f"{val_df.count():,}",
-        metric,
-    )
-
-    best_score = float("-inf")
-    best_params = _default_model_params(model_type)
-    trial_results: list[dict[str, Any]] = []
-
-    for trial_idx, params in enumerate(combos, start=1):
-        logger.info("Grid search trial %s/%s: %s", trial_idx, len(combos), params)
-        trial_models, _ = train_multilabel_model(
-            train_df,
-            max_labels=None,
-            model_type=model_type,
-            model_params=params,
-            label_list=label_list,
-        )
-        val_predictions = predict_multilabel(
-            val_df,
-            label_list,
-            threshold,
-            models=trial_models,
-            model_type=model_type,
-        )
-        val_metrics = _compute_multilabel_metrics(val_predictions, label_list)
-        score = float(val_metrics[metric])
-        trial_results.append({**params, metric: score, "val_documents": val_metrics["documents"]})
-        logger.info("Grid search trial %s/%s %s=%.4f", trial_idx, len(combos), metric, score)
-        if score > best_score:
-            best_score = score
-            best_params = dict(params)
-
-    logger.info(
-        "Grid search best params: %s (%s=%.4f)",
-        best_params,
-        metric,
-        best_score,
-    )
-    return best_params, trial_results
-
-
-def _build_binary_classifier(model_type: str, model_params: dict[str, Any]) -> Any:
-    if model_type == "logistic_regression":
-        return LogisticRegression(
-            featuresCol=FEATURES_COL,
-            labelCol="binary_label",
-            family="binomial",
-            maxIter=int(model_params["maxIter"]),
-            regParam=float(model_params["regParam"]),
-            elasticNetParam=float(model_params["elasticNetParam"]),
-        )
-    if model_type == "random_forest":
-        return RandomForestClassifier(
-            featuresCol=FEATURES_COL,
-            labelCol="binary_label",
-            numTrees=int(model_params["numTrees"]),
-            maxDepth=int(model_params["maxDepth"]),
-            maxBins=int(model_params["maxBins"]),
-        )
-    raise ValueError(f"Unsupported model_type={model_type!r}")
-
-
-def train_multilabel_model(
-    train_df: DataFrame,
-    max_labels: int | None,
-    model_type: str,
-    model_params: dict[str, Any],
-    *,
-    label_list: list[str] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
-    if model_type == "random_forest":
-        logger.warning(
-            "RandomForestClassifier may be slow or memory-heavy on high-dimensional sparse text features."
-        )
-    logger.info("%s hyperparameters: %s", model_type, model_params)
-
-    label_list = label_list or _collect_training_labels(train_df, max_labels)
-    models: dict[str, Any] = {}
-
-    for label in label_list:
-        binary_train = train_df.withColumn(
-            "binary_label",
-            F.when(F.array_contains(F.col(TARGET_LABELS_COL), label), 1.0).otherwise(0.0),
-        )
-        classifier = _build_binary_classifier(model_type, model_params)
-        models[label] = classifier.fit(binary_train)
-        logger.debug("Trained binary model for label=%s", label)
-
-    logger.info(
-        "Binary relevance training complete: %s per-label models",
-        f"{len(models):,}",
-    )
-    return models, label_list
-
 
 def save_outputs(
     spark,
@@ -495,4 +363,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

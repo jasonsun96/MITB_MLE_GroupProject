@@ -1,13 +1,8 @@
-"""Central path helpers for gold runs, model_bank features, and experiments."""
-from __future__ import annotations
-
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import yaml
-
 from gold_io import PROJECT_ROOT
 
 _SCHEMA: dict[str, Any] | None = None
@@ -321,9 +316,7 @@ def resolve_training_paths(
         "dcw_score_path": model_bank_dcw_score_path(dcw_id),
         "dcw_train_doc_ids_path": model_bank_dcw_train_doc_ids_path(dcw_id),
         "features_root": model_bank_features_root(feature_run_id),
-        "default_model_name": schema["model_bank"]["experiments"].get(
-            "default_model_name", "random_forest"
-        ),
+        "default_model_name": schema["model_bank"]["experiments"].get("default_model_name", "random_forest"),
     }
 
 

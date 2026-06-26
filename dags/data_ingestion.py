@@ -2,6 +2,7 @@ import datetime
 import os
 
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.sdk import DAG
 
 IMAGE_NAME = "document_topic_tagger"
@@ -18,25 +19,51 @@ COMMON = dict(
     environment=R2_ENV,
     auto_remove="force",
     docker_url="unix://var/run/docker.sock",
+    mount_tmp_dir=False,
 )
+
+DEFAULT_ARGS = {
+    "retries": 2,
+    "retry_delay": datetime.timedelta(minutes=1),
+}
+
+
+def should_run_wiki_branch(**context) -> bool:
+    run_wiki = context["params"].get("run_wiki", True)
+    if isinstance(run_wiki, str):
+        return run_wiki.strip().lower() not in {"0", "false", "f", "no", "n", "off"}
+
+    return bool(run_wiki)
+
 
 with DAG(
     dag_id="medallion_pipeline",
-    start_date=datetime.datetime(2024, 1, 1),
+    start_date=datetime.datetime(2027, 1, 1),
     schedule="@monthly",
+    max_active_runs=1,
+    catchup=False,
+    default_args=DEFAULT_ARGS,
+    params={
+        "run_wiki": True,
+    },
 ):
     # ---- bronze ----
     bronze_ingest = DockerOperator(
         task_id="ingest_bronze",
-        command="python include/bronze/ingest_bronze.py --start-date {{ ds }} --end-date {{ ds }}",
+        command=("python include/bronze/ingest_bronze.py " "--start-date {{ ds }} " "--end-date {{ ds }} " "--batch-id {{ ds_nodash }}"),
         **COMMON,
     )
 
     # ---- silver ----
     silver_legal = DockerOperator(
         task_id="process_silver_legal_docs",
-        command="python include/silver/process_legal_docs.py",
+        command="python include/silver/process_legal_docs.py --snapshot-date {{ ds }}",
         **COMMON,
+    )
+
+    run_wiki_branch = ShortCircuitOperator(
+        task_id="should_run_wiki_branch",
+        python_callable=should_run_wiki_branch,
     )
 
     silver_wiki = DockerOperator(
@@ -48,26 +75,26 @@ with DAG(
     # ---- gold: label store (train/val/test/oot split assignment) ----
     build_label_store = DockerOperator(
         task_id="build_label_store",
-        command="python include/gold/label_store.py",
+        command="python include/gold/label_store.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     # ---- gold: per-document features (all read from silver) ----
     gold_ngram_counts = DockerOperator(
         task_id="extract_ngram_counts",
-        command="python include/gold/ngram_processing.py",
+        command="python include/gold/ngram_processing.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     gold_pos_counts = DockerOperator(
         task_id="extract_pos_counts",
-        command="python include/gold/pos_counts.py",
+        command="python include/gold/pos_counts.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
     gold_legal_embeddings = DockerOperator(
         task_id="extract_legal_embeddings",
-        command="python include/gold/legal_embeddings.py",
+        command="python include/gold/legal_embeddings.py --snapshot-date {{ ds }}",
         **COMMON,
     )
 
@@ -83,13 +110,7 @@ with DAG(
         **COMMON,
     )
 
-    # ---- dependencies ----
-    # gold jobs read SILVER tables, so they must run after their silver task
-    bronze_ingest >> [silver_legal, silver_wiki]
+    bronze_ingest >> [silver_legal, run_wiki_branch]
+    run_wiki_branch >> silver_wiki
     silver_legal >> [build_label_store, gold_ngram_counts, gold_pos_counts, gold_legal_embeddings]
     silver_wiki >> [gold_pos_counts_wiki, gold_wiki_embeddings]
-
-    # ---- not yet wired (pending label_store/labels table + column alignment) ----
-    # tfidf_processing.py        << [gold_ngram_counts, build_label_store]
-    # domain_concept_weight.py   << [gold_pos_counts, gold_pos_counts_wiki, build_label_store]
-    # model_training.py          << [tfidf, dcw, gold_legal_embeddings, build_label_store]
